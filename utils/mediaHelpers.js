@@ -1,7 +1,7 @@
 // Shared between the ad-hoc chat upload endpoint (modules/media) and the
 // persistent Media Library (modules/media-library) so the two never drift on
-// what file types/sizes are accepted or how a mimetype maps to Cloudinary's
-// resource_type / this app's messageType.
+// what file types/sizes are accepted or how a mimetype maps to this app's
+// messageType.
 const ALLOWED_MIMETYPES = [
   "image/jpeg", "image/png", "image/gif", "image/webp",
   "video/mp4", "video/3gpp",
@@ -15,13 +15,6 @@ const ALLOWED_MIMETYPES = [
 
 const MAX_FILE_SIZE = 16 * 1024 * 1024; // 16 MB
 
-const getResourceType = (mimetype) => {
-  if (mimetype.startsWith("image/")) return "image";
-  if (mimetype.startsWith("video/")) return "video";
-  if (mimetype.startsWith("audio/")) return "video"; // Cloudinary uses "video" for audio
-  return "raw"; // documents (pdf, docx, etc.)
-};
-
 const getMessageType = (mimetype) => {
   if (mimetype.startsWith("image/")) return "IMAGE";
   if (mimetype.startsWith("video/")) return "VIDEO";
@@ -34,4 +27,4 @@ const mediaFileFilter = (req, file, cb) => {
   else cb(new Error(`File type ${file.mimetype} is not supported`));
 };
 
-module.exports = { ALLOWED_MIMETYPES, MAX_FILE_SIZE, getResourceType, getMessageType, mediaFileFilter };
+module.exports = { ALLOWED_MIMETYPES, MAX_FILE_SIZE, getMessageType, mediaFileFilter };

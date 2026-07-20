@@ -1,7 +1,7 @@
-const cloudinary = require("../../utils/cloudinary");
+const storage = require("../../utils/storage");
 const prisma = require("../../config/prisma");
 const AppError = require("../../utils/AppError");
-const { getResourceType, getMessageType } = require("../../utils/mediaHelpers");
+const { getMessageType } = require("../../utils/mediaHelpers");
 
 const VALID_TYPES = ["IMAGE", "VIDEO", "AUDIO", "DOCUMENT"];
 
@@ -39,49 +39,49 @@ const getAllMedia = async (req, res, next) => {
   }
 };
 
-// Uploads to Cloudinary (same folder structure as the ad-hoc chat uploader)
-// and persists a MediaAsset row so it can be reused later — e.g. picked as a
+// Uploads to R2 (same folder structure as the ad-hoc chat uploader) and
+// persists a MediaAsset row so it can be reused later — e.g. picked as a
 // template header — instead of re-uploading the same file every time.
-const uploadMedia = (req, res, next) => {
+const uploadMedia = async (req, res, next) => {
   if (!req.file) return next(new AppError("No file provided", 400));
 
-  const resourceType = getResourceType(req.file.mimetype);
   const mediaType = getMessageType(req.file.mimetype);
   const filename = req.body?.name?.trim() || req.file.originalname || null;
 
-  const uploadStream = cloudinary.uploader.upload_stream(
-    { resource_type: resourceType, folder: "everlast-crm/library" },
-    async (error, result) => {
-      if (error) {
-        console.error("Cloudinary upload error:", error.message);
-        return next(new AppError("File upload failed", 502));
-      }
-      try {
-        const asset = await prisma.mediaAsset.create({
-          data: {
-            url: result.secure_url,
-            publicId: result.public_id,
-            mediaType,
-            format: result.format,
-            bytes: result.bytes,
-            width: result.width ?? null,
-            height: result.height ?? null,
-            filename,
-            createdById: req.user.id,
-          },
-        });
-        res.status(201).json({ success: true, data: { ...asset, usageCount: 0 } });
-      } catch (dbErr) {
-        next(dbErr);
-      }
-    },
-  );
+  let result;
+  try {
+    result = await storage.uploadBuffer({
+      buffer: req.file.buffer,
+      mimetype: req.file.mimetype,
+      folder: "everlast-crm/library",
+    });
+  } catch (error) {
+    console.error("Storage upload error:", error.message);
+    return next(new AppError("File upload failed", 502));
+  }
 
-  uploadStream.end(req.file.buffer);
+  try {
+    const asset = await prisma.mediaAsset.create({
+      data: {
+        url: result.url,
+        publicId: result.key,
+        mediaType,
+        format: result.format,
+        bytes: result.bytes,
+        width: result.width,
+        height: result.height,
+        filename,
+        createdById: req.user.id,
+      },
+    });
+    res.status(201).json({ success: true, data: { ...asset, usageCount: 0 } });
+  } catch (dbErr) {
+    next(dbErr);
+  }
 };
 
 // Rename the library's display label — purely cosmetic, doesn't touch the
-// underlying Cloudinary file or its public id.
+// underlying R2 object or its key.
 const updateMedia = async (req, res, next) => {
   try {
     const id = parseInt(req.params.id);
@@ -107,13 +107,15 @@ const deleteMedia = async (req, res, next) => {
     const asset = await prisma.mediaAsset.findUnique({ where: { id } });
     if (!asset) return next(new AppError("Media not found", 404));
 
-    const resourceType = asset.mediaType === "IMAGE" ? "image" : asset.mediaType === "DOCUMENT" ? "raw" : "video";
     try {
-      await cloudinary.uploader.destroy(asset.publicId, { resource_type: resourceType });
+      // publicId holds the active provider's object key / public_id. If a row
+      // was created under the other provider, this delete is a harmless miss
+      // (wrong key for the current backend) — tolerated by the catch below.
+      await storage.deleteObject({ key: asset.publicId, mediaType: asset.mediaType });
     } catch (err) {
-      // Don't block removing the library entry on a Cloudinary-side hiccup —
-      // an orphaned remote file is a smaller problem than a stuck UI record.
-      console.error("Cloudinary delete error:", err.message);
+      // Don't block removing the library entry on a storage-side hiccup — an
+      // orphaned remote file is a smaller problem than a stuck UI record.
+      console.error("Storage delete error:", err.message);
     }
 
     await prisma.mediaAsset.delete({ where: { id } });

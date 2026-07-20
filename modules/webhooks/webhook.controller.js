@@ -1,64 +1,18 @@
-const axios = require("axios");
 const prisma = require("../../config/prisma");
-const cloudinary = require("../../utils/cloudinary");
+const storage = require("../../utils/storage");
+const { fetchAndStoreMediaWithRetry } = require("../../utils/whatsappMedia");
 const { getIO } = require("../../utils/socket");
 
-const API_VERSION = process.env.WHATSAPP_API_VERSION || "v19.0";
-
-const CLOUDINARY_RESOURCE_TYPE = {
-  IMAGE: "image",
-  VIDEO: "video",
-  AUDIO: "video", // Cloudinary uses "video" for audio
-  DOCUMENT: "raw",
-  STICKER: "image", // WebP stickers are images
-};
-
-const uploadReceivedMediaToCloudinary = async (messageId, mediaId, messageType) => {
+// Fire-and-forget download of an incoming media message. Retries a few times so
+// a single transient failure doesn't strand the file — and even if all retries
+// fail, the message keeps its mediaId, so opening it later re-downloads it
+// on demand (see getMessageMedia).
+const uploadReceivedMedia = async (messageId, mediaId, messageType) => {
   try {
-    // 1. Get the temporary download URL from Meta
-    const metaRes = await axios.get(
-      `https://graph.facebook.com/${API_VERSION}/${mediaId}`,
-      { headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` } },
-    );
-    const downloadUrl = metaRes.data?.url;
-    if (!downloadUrl) return;
-
-    // 2. Download the file from Meta as a stream
-    const fileRes = await axios.get(downloadUrl, {
-      headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` },
-      responseType: "stream",
-    });
-
-    // 3. Upload stream directly to Cloudinary
-    const resourceType = CLOUDINARY_RESOURCE_TYPE[messageType] || "raw";
-    const uploadOptions = { resource_type: resourceType, folder: "everlast-crm/received" };
-    if (messageType === "STICKER") {
-      uploadOptions.flags = ["animated"];
-      uploadOptions.format = "webp";
-    }
-    const cloudinaryResult = await new Promise((resolve, reject) => {
-      const uploadStream = cloudinary.uploader.upload_stream(
-        uploadOptions,
-        (err, result) => (err ? reject(err) : resolve(result)),
-      );
-      fileRes.data.pipe(uploadStream);
-    });
-
-    // 4. Save Cloudinary URL on the message
-    await prisma.message.update({
-      where: { id: messageId },
-      data: { mediaUrl: cloudinaryResult.secure_url },
-    });
-
-    // 5. Notify frontend the media is ready
-    getIO().emit("message.media_ready", {
-      messageId,
-      mediaUrl: cloudinaryResult.secure_url,
-    });
-
-    console.log(`Webhook: media uploaded to Cloudinary for message ${messageId}`);
+    await fetchAndStoreMediaWithRetry({ messageId, mediaId, messageType });
+    console.log(`Webhook: media uploaded (${storage.activeProvider()}) for message ${messageId}`);
   } catch (err) {
-    console.error(`Webhook: Cloudinary upload failed for message ${messageId}:`, err.message);
+    console.error(`Webhook: media upload failed for message ${messageId} (recoverable on view):`, err.message);
   }
 };
 
@@ -91,6 +45,23 @@ const extractFromPayload = (body) => {
 
   const name = contact?.profile?.name || contact?.profile?.username || null;
 
+  const rawType = msg.type;
+
+  // Media id, extracted generically: every media sub-object Meta sends is keyed
+  // by its own type and carries an `id` (msg.image.id, msg.document.id, ...).
+  // Falling back to msg[rawType]?.id means a NEW media type we haven't mapped
+  // yet still gets its id captured, so it stays downloadable/recoverable.
+  const mediaId =
+    msg.image?.id ||
+    msg.video?.id ||
+    msg.audio?.id ||
+    msg.document?.id ||
+    msg.sticker?.id ||
+    (rawType ? msg[rawType]?.id : null) ||
+    null;
+
+  const mappedType = MESSAGE_TYPE_MAP[rawType];
+
   const content =
     msg.text?.body ||
     msg.interactive?.button_reply?.title ||
@@ -99,16 +70,15 @@ const extractFromPayload = (body) => {
     msg.video?.caption ||
     msg.audio?.caption ||
     msg.document?.caption ||
-    (msg.type === "sticker" ? "[sticker]" : null) ||
-    "[media message]";
+    (rawType === "sticker" ? "[sticker]" : null) ||
+    // Diagnostic placeholder: if we couldn't map the type AND there's no media
+    // to download, record what the type actually was instead of a generic label.
+    (mediaId || mappedType ? "[media message]" : `[unsupported: ${rawType || "unknown"}]`);
 
-  const mediaId =
-    msg.image?.id ||
-    msg.video?.id ||
-    msg.audio?.id ||
-    msg.document?.id ||
-    msg.sticker?.id ||
-    null;
+  // If Meta sent a media id under an unmapped type, we still don't know the exact
+  // kind — treat it as DOCUMENT so it renders as a downloadable file (never a
+  // broken player) while the real bytes are fetched by mediaId.
+  const messageType = mappedType || (mediaId ? "DOCUMENT" : "TEXT");
 
   // WA ID of the message being quoted (present when customer replies to a specific message)
   const quotedWhatsappMessageId = msg.context?.id || null;
@@ -118,7 +88,9 @@ const extractFromPayload = (body) => {
     name,
     content,
     mediaId,
-    messageType: MESSAGE_TYPE_MAP[msg.type] || "TEXT",
+    messageType,
+    rawType,
+    isRecognized: Boolean(mappedType),
     whatsappMessageId: msg.id,
     quotedWhatsappMessageId,
   };
@@ -158,7 +130,20 @@ const handleStatusUpdate = async (value) => {
     data: { status: mapped },
   });
 
-  console.log(`Webhook: message ${whatsappMessageId} status → ${mapped}`);
+  // On failure, Meta puts the reason in statusEntry.errors — log it loudly so a
+  // FAILED status is actually diagnosable (code + title + details), instead of a
+  // bare "status → FAILED" that tells you nothing about why delivery failed.
+  if (status === "failed" && Array.isArray(statusEntry.errors) && statusEntry.errors.length) {
+    const err = statusEntry.errors[0];
+    const details = err.error_data?.details || err.message || "";
+    console.error(
+      `Webhook: message ${whatsappMessageId} FAILED — code ${err.code} (${err.title})` +
+      (details ? ` — ${details}` : "") +
+      (err.href ? ` [${err.href}]` : ""),
+    );
+  } else {
+    console.log(`Webhook: message ${whatsappMessageId} status → ${mapped}`);
+  }
   getIO().emit("message.status_updated", { messageId: message.id, status: mapped });
 };
 
@@ -223,8 +208,17 @@ const receiveWhatsAppMessage = async (req, res) => {
       return;
     }
 
-    const { phone, name, content, mediaId, messageType, whatsappMessageId, quotedWhatsappMessageId } = extracted;
-    console.log("Webhook: processing inbound message | type:", messageType);
+    const { phone, name, content, mediaId, messageType, rawType, isRecognized, whatsappMessageId, quotedWhatsappMessageId } = extracted;
+    console.log("Webhook: processing inbound message | type:", messageType, "| rawType:", rawType);
+
+    // Diagnostic: when Meta sends a type we don't cleanly recognize, log the full
+    // raw message so we can see its exact shape and add proper handling. This is
+    // what makes an "[unsupported: ...]" / uncaptured-media case debuggable —
+    // the payload is otherwise not stored anywhere.
+    if (!isRecognized) {
+      const rawMsg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+      console.warn("Webhook: UNRECOGNIZED message type '" + rawType + "' — raw payload:", JSON.stringify(rawMsg));
+    }
 
     // Deduplicate: if we already saved this WhatsApp message ID, skip it
     if (whatsappMessageId) {
@@ -283,9 +277,9 @@ const receiveWhatsAppMessage = async (req, res) => {
     });
     console.log("Webhook: saved message id", message.id, quotedMessageId ? `(reply to ${quotedMessageId})` : "");
 
-    // Fire-and-forget: upload media to Cloudinary in background
+    // Fire-and-forget: upload media to storage in background
     if (mediaId) {
-      uploadReceivedMediaToCloudinary(message.id, mediaId, messageType);
+      uploadReceivedMedia(message.id, mediaId, messageType);
     }
 
     await prisma.conversation.update({

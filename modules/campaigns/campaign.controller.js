@@ -369,15 +369,50 @@ const updateCampaign = async (req, res, next) => {
   }
 };
 
+// Deletable terminal/idle states. RUNNING/PAUSED/SCHEDULED are intentionally
+// excluded — an in-flight or pending send must be cancelled first, so deletion
+// can never silently abandon a send mid-flight. CampaignRecipient rows are
+// removed automatically (onDelete: Cascade in the schema).
+const DELETABLE_STATUSES = ["DRAFT", "COMPLETED", "CANCELLED"];
+
 const deleteCampaign = async (req, res, next) => {
   try {
     const id = parseInt(req.params.id);
     const existing = await prisma.campaign.findUnique({ where: { id } });
     if (!existing) return next(new AppError("Campaign not found", 404));
-    if (existing.status !== "DRAFT") return next(new AppError("Only DRAFT campaigns can be deleted", 400));
+    if (!DELETABLE_STATUSES.includes(existing.status)) {
+      return next(new AppError(`Can't delete a ${existing.status} campaign — cancel it first`, 400));
+    }
 
     await prisma.campaign.delete({ where: { id } });
     res.status(200).json({ success: true, message: "Campaign deleted" });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Bulk delete — one round-trip for many campaigns. Skips any that are
+// missing or in a non-deletable state and reports how many were actually
+// removed, so a partial selection never fails wholesale.
+const bulkDeleteCampaigns = async (req, res, next) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return next(new AppError("ids must be a non-empty array", 400));
+    }
+    const parsedIds = ids.map((n) => parseInt(n)).filter((n) => Number.isInteger(n));
+    if (parsedIds.length === 0) return next(new AppError("No valid campaign ids provided", 400));
+
+    const result = await prisma.campaign.deleteMany({
+      where: { id: { in: parsedIds }, status: { in: DELETABLE_STATUSES } },
+    });
+
+    res.status(200).json({
+      success: true,
+      deletedCount: result.count,
+      skippedCount: parsedIds.length - result.count,
+      message: `Deleted ${result.count} campaign${result.count !== 1 ? "s" : ""}`,
+    });
   } catch (err) {
     next(err);
   }
@@ -493,6 +528,7 @@ module.exports = {
   createCampaign,
   updateCampaign,
   deleteCampaign,
+  bulkDeleteCampaigns,
   sendCampaignNow,
   cancelCampaign,
   pauseCampaign,

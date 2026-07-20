@@ -94,6 +94,19 @@ const validateButtons = (buttons) => {
 const toMetaName = (name) =>
   name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 
+// Meta only accepts these mimetypes for template headers. Anything else (very
+// commonly WebP/HEIC/GIF images) is rejected with a cryptic "File Type Not
+// Supported" error at submission time.
+const META_HEADER_IMAGE_MIME = ["image/jpeg", "image/png"];
+
+// If a Cloudinary delivery URL points at an unsupported image format, rewrite it
+// to force on-the-fly conversion to PNG (f_png). Returns null for non-Cloudinary
+// URLs (nothing we can transform).
+function cloudinaryAsPng(url) {
+  if (!/res\.cloudinary\.com\/[^/]+\/image\/upload\//.test(url)) return null;
+  return url.replace("/image/upload/", "/image/upload/f_png/");
+}
+
 // Uploads a remote media file to Meta's resumable upload API and returns the
 // media "handle" needed to submit a template with an IMAGE/VIDEO/DOCUMENT
 // header for approval. Requires WHATSAPP_APP_ID (separate from the WABA id).
@@ -104,9 +117,24 @@ async function uploadHeaderMediaHandle(mediaUrl) {
     throw new AppError("WHATSAPP_APP_ID is not configured — required to submit templates with an image/video/document header", 500);
   }
 
-  const file = await axios.get(mediaUrl, { responseType: "arraybuffer" });
+  let file = await axios.get(mediaUrl, { responseType: "arraybuffer" });
+  let contentType = file.headers["content-type"] || "application/octet-stream";
+
+  // Auto-fix unsupported image headers (e.g. WebP) so Meta doesn't reject them.
+  if (contentType.startsWith("image/") && !META_HEADER_IMAGE_MIME.includes(contentType)) {
+    const pngUrl = cloudinaryAsPng(mediaUrl);
+    if (pngUrl) {
+      file = await axios.get(pngUrl, { responseType: "arraybuffer" });
+      contentType = file.headers["content-type"] || "image/png";
+    } else {
+      throw new AppError(
+        `Template header images must be JPEG or PNG — this file is ${contentType}. Please re-upload it as a JPEG or PNG.`,
+        400,
+      );
+    }
+  }
+
   const fileBuffer = Buffer.from(file.data);
-  const contentType = file.headers["content-type"] || "application/octet-stream";
 
   const session = await axios.post(
     `https://graph.facebook.com/${getApiVersion()}/${appId}/uploads`,

@@ -1,7 +1,7 @@
-const axios = require("axios");
 const prisma = require("../../config/prisma");
 const AppError = require("../../utils/AppError");
 const { sendWhatsAppMessage } = require("../../utils/whatsappClient");
+const { fetchAndStoreMedia } = require("../../utils/whatsappMedia");
 const { getIO } = require("../../utils/socket");
 
 const sendMessage = async (req, res, next) => {
@@ -151,43 +151,30 @@ const getMessageMedia = async (req, res, next) => {
     if (!message) return next(new AppError("Message not found", 404));
     if (!message.mediaId && !message.mediaUrl) return next(new AppError("This message has no media", 404));
 
-    // If already uploaded to Cloudinary, redirect directly — no Meta call needed
+    // Already stored — redirect straight to the permanent storage URL.
     if (message.mediaUrl) {
       return res.redirect(message.mediaUrl);
     }
 
-    // Step 1: get the temporary download URL from Meta
-    let metaRes;
+    // Not stored yet (background upload failed, or hasn't finished). Re-download
+    // from Meta by the stored mediaId AND persist it, so this both serves the
+    // file now and permanently self-heals the message for every future view.
     try {
-      metaRes = await axios.get(
-        `https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION || "v19.0"}/${message.mediaId}`,
-        { headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` } },
-      );
-    } catch (metaErr) {
-      const detail = metaErr.response?.data || metaErr.message;
-      console.error("Meta media URL fetch failed:", JSON.stringify(detail));
-      return next(new AppError("Failed to retrieve media from Meta — access token may be expired", 502));
-    }
-
-    const downloadUrl = metaRes.data?.url;
-    if (!downloadUrl) return next(new AppError("Meta did not return a download URL", 502));
-
-    // Step 2: stream the file back to the client
-    let fileRes;
-    try {
-      fileRes = await axios.get(downloadUrl, {
-        headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` },
-        responseType: "stream",
+      const { buffer, mimetype } = await fetchAndStoreMedia({
+        messageId: message.id,
+        mediaId: message.mediaId,
+        messageType: message.messageType,
       });
-    } catch (dlErr) {
-      console.error("Meta media download failed:", dlErr.message);
-      return next(new AppError("Failed to download media from Meta", 502));
+      res.setHeader("Content-Type", mimetype || "application/octet-stream");
+      res.setHeader("Cache-Control", "private, max-age=3600");
+      return res.send(buffer);
+    } catch (err) {
+      const detail = err.response?.data || err.message;
+      console.error(`getMessageMedia: recover failed for message ${message.id}:`, JSON.stringify(detail));
+      // Meta only retains media for a limited window; once it's purged the
+      // mediaId no longer resolves and the file is unrecoverable.
+      return next(new AppError("Media is no longer available from WhatsApp", 502));
     }
-
-    const contentType = fileRes.headers["content-type"] || "application/octet-stream";
-    res.setHeader("Content-Type", contentType);
-    res.setHeader("Cache-Control", "private, max-age=3600");
-    fileRes.data.pipe(res);
   } catch (err) {
     next(err);
   }
