@@ -9,6 +9,7 @@ datasource db {
 
 enum Role {
   ADMIN
+  MARKETING
   AGENT
 }
 
@@ -102,6 +103,10 @@ model User {
   username              String         @unique @db.VarChar(20)
   passwordHash          String
   role                  Role           @default(AGENT)
+  // Account enabled/disabled. Distinct from `status`, which is presence
+  // (ONLINE/OFFLINE/ON_BREAK). A user with isActive=false is rejected by
+  // `protect` on their next request and cannot log in at all.
+  isActive              Boolean        @default(true)
   status                AgentStatus    @default(OFFLINE)
   lastActiveAt          DateTime?
   createdAt             DateTime       @default(now())
