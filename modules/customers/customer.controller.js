@@ -1,5 +1,6 @@
 const prisma = require("../../config/prisma");
 const AppError = require("../../utils/AppError");
+const { buildCustomerWhere, validateDefinition } = require("../../utils/segmentFilter");
 const {
   normalizeImportPhone,
   parseGender,
@@ -74,21 +75,34 @@ async function buildImportPlan(rows, dateFormat = "auto", defaultCountry = "") {
   return { total: rows.length, invalid, duplicates, toCreate };
 }
 
+// Segment rules arrive as a JSON-encoded `filter` query param — a nested rule
+// object doesn't survive flat query encoding, and sending it as JSON keeps this
+// endpoint speaking exactly the same grammar as /api/segments/preview. A
+// malformed value is a 400, never a silently ignored filter that would show the
+// user the whole database while they believe they are looking at a segment.
+function parseFilterParam(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    validateDefinition(parsed);
+    return parsed;
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+    throw new AppError("filter must be valid JSON of the form { match, rules }", 400);
+  }
+}
+
 const getAllCustomers = async (req, res, next) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
     const skip = (page - 1) * limit;
 
-    const where = {};
-    if (req.query.search) {
-      where.OR = [
-        { name: { contains: req.query.search, mode: "insensitive" } },
-        { phone: { contains: req.query.search, mode: "insensitive" } },
-        { email: { contains: req.query.search, mode: "insensitive" } },
-        { chartNumber: { contains: req.query.search, mode: "insensitive" } },
-      ];
-    }
+    const definition = parseFilterParam(req.query.filter);
+    const where = await buildCustomerWhere(definition, {
+      search: req.query.search,
+      excludeOptedOut: req.query.excludeOptedOut === "true",
+    });
 
     const [customers, total] = await Promise.all([
       // id tiebreaker keeps pagination stable when many rows share a createdAt
@@ -107,6 +121,37 @@ const getAllCustomers = async (req, res, next) => {
   }
 };
 
+// Every id matching the current filter, not just the current page. "Select all
+// 1,284 matches" has to mean all of them — resolving it client-side from a
+// paged list is how a campaign quietly goes out to the 20 people on screen.
+// Capped so one request can't try to materialise an unbounded audience.
+const MAX_RESOLVED_IDS = 20000;
+
+const getFilteredCustomerIds = async (req, res, next) => {
+  try {
+    const definition = parseFilterParam(req.query.filter);
+    const where = await buildCustomerWhere(definition, {
+      search: req.query.search,
+      excludeOptedOut: req.query.excludeOptedOut === "true",
+    });
+
+    const total = await prisma.customer.count({ where });
+    if (total > MAX_RESOLVED_IDS) {
+      return next(
+        new AppError(
+          `That filter matches ${total.toLocaleString()} contacts — narrow it below ${MAX_RESOLVED_IDS.toLocaleString()} before selecting them all`,
+          400,
+        ),
+      );
+    }
+
+    const rows = await prisma.customer.findMany({ where, select: { id: true }, orderBy: { id: "asc" } });
+    res.status(200).json({ success: true, data: { customerIds: rows.map((r) => r.id), count: rows.length } });
+  } catch (err) {
+    next(err);
+  }
+};
+
 const getCustomerById = async (req, res, next) => {
   try {
     const customer = await prisma.customer.findUnique({ where: { id: parseInt(req.params.id) } });
@@ -119,8 +164,13 @@ const getCustomerById = async (req, res, next) => {
 
 const createCustomer = async (req, res, next) => {
   try {
-    const { name, phone, email, tags, notes, chartNumber, nationality, gender, dateOfBirth, joinDate, departments } = req.body;
+    let { name, phone, email, tags, notes, chartNumber, nationality, gender, dateOfBirth, joinDate, departments } = req.body;
     if (!phone) return next(new AppError("Phone number is required", 400));
+    // Same normalisation as CSV import (digits, international, no "+"), so a
+    // hand-added "+971 50…" or "050…" matches the digits Meta sends back.
+    const norm = normalizeImportPhone(phone, "AE");
+    if (norm.error) return next(new AppError(`Phone number: ${norm.error}`, 400));
+    phone = norm.phone;
 
     const genderVal = parseGender(gender);
     if (genderVal === undefined) return next(new AppError("Gender must be 'Male' or 'Female'", 400));
@@ -160,10 +210,13 @@ const createCustomer = async (req, res, next) => {
 const updateCustomer = async (req, res, next) => {
   try {
     const id = parseInt(req.params.id);
-    const { name, phone, email, tags, notes, optedOut, chartNumber, nationality, gender, dateOfBirth, joinDate, departments } = req.body;
+    let { name, phone, email, tags, notes, optedOut, chartNumber, nationality, gender, dateOfBirth, joinDate, departments } = req.body;
 
     // Validate phone uniqueness before updating
     if (phone !== undefined) {
+      const norm = normalizeImportPhone(phone, "AE");
+      if (norm.error) return next(new AppError(`Phone number: ${norm.error}`, 400));
+      phone = norm.phone;
       const conflict = await prisma.customer.findFirst({
         where: { phone, id: { not: id } },
       });
@@ -300,4 +353,4 @@ const bulkDeleteCustomers = async (req, res, next) => {
   }
 };
 
-module.exports = { getAllCustomers, getCustomerById, createCustomer, updateCustomer, validateImport, importCustomers, deleteCustomer, bulkDeleteCustomers };
+module.exports = { getAllCustomers, getFilteredCustomerIds, getCustomerById, createCustomer, updateCustomer, validateImport, importCustomers, deleteCustomer, bulkDeleteCustomers };

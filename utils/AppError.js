@@ -4,10 +4,13 @@ class AppError extends Error {
   // deactivated" — both are 401s with different correct responses. Named
   // errorCode rather than code to avoid colliding with Prisma's err.code, which
   // errorHandler also inspects.
-  constructor(message, statusCode, errorCode) {
+  // details: optional structured context for the client, e.g. which template
+  // field Meta rejected ({ field: "header" }).
+  constructor(message, statusCode, errorCode, details) {
     super(message);
     this.statusCode = statusCode;
     if (errorCode) this.errorCode = errorCode;
+    if (details) this.details = details;
   }
 }
 

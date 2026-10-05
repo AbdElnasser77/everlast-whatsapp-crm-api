@@ -6,7 +6,16 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "seed": "node utils/seedAdmin.js"
+    "tunnel": "ngrok http --url=kate-nonrecurent-mui.ngrok-free.dev 8000",
+    "seed": "node utils/seedUsers.js",
+    "check:segments": "node tests/segments.check.js",
+    "check:segments:fixture": "node tests/segments.fixture.check.js",
+    "wa:number": "node utils/registerWhatsappNumber.js",
+    "seed:numbers": "node utils/seedWhatsappNumbers.js",
+    "check:scoping": "node tests/scoping.check.js",
+    "check:roles": "node tests/roles.check.js",
+    "check:inbox": "node tests/inbox.check.js",
+    "check:quiet-hours": "node tests/quietHours.check.js"
   },
   "keywords": [],
   "author": "",

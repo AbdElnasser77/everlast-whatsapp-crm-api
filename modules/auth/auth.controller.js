@@ -2,6 +2,7 @@ const jwt = require("jsonwebtoken");
 const bcryptjs = require("bcryptjs");
 const prisma = require("../../config/prisma");
 const AppError = require("../../utils/AppError");
+const { permissionsFor } = require("../../config/permissions");
 
 const COOKIE_OPTIONS = {
   httpOnly: true,
@@ -22,6 +23,12 @@ const login = async (req, res, next) => {
 
     const isMatch = await bcryptjs.compare(password, user.passwordHash);
     if (!isMatch) return next(new AppError("Invalid credentials", 401));
+    // Checked after the password, so this can't be used to discover which
+    // usernames exist. Previously a deactivated account was issued a token and
+    // only rejected on its next request.
+    if (!user.isActive) {
+      return next(new AppError("This account has been deactivated", 401, "ACCOUNT_DEACTIVATED"));
+    }
 
     await prisma.user.update({
       where: { id: user.id },
@@ -43,6 +50,7 @@ const login = async (req, res, next) => {
         name: user.name,
         username: user.username,
         role: user.role,
+        permissions: permissionsFor(user.role),
         status: "ONLINE",
       },
     });

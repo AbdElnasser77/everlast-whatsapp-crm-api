@@ -76,15 +76,62 @@ Everything related to the database schema.
 |---|---|
 | `schema.prisma` | Single source of truth for all database models, enums, and relations |
 
-**Models:** `User`, `Customer`, `Conversation`, `Message`, `AuditLog`
+**Models:** `User`, `Customer`, `Conversation`, `Message`, `AuditLog`, `WhatsAppNumber`, `CustomerOptOut`
 
 **Enums:** `Role`, `AgentStatus`, `ConversationStatus`, `SenderType`, `MessageType`, `MessageStatus`
 
 After any schema change, run:
 ```bash
-npx prisma db push       # applies changes to the database
-npx prisma generate      # regenerates the Prisma client
+npx prisma migrate dev --name <what-changed>   # creates + applies a migration
+npx prisma generate                            # regenerates the Prisma client
 ```
+
+In production: `npx prisma migrate deploy`.
+
+> **Do not use `npx prisma db push`.** This project moved to Prisma Migrate for
+> multi-number support. `db push` cannot express the partial unique index that
+> keeps exactly one `WhatsAppNumber.isDefault`, and running it would silently
+> drop that index.
+
+## Multiple WhatsApp numbers
+
+The CRM sends and receives on several WhatsApp lines. Numbers are rows in
+`WhatsAppNumber`; their **access tokens stay in the environment**, named by the
+row's `tokenEnvKey`, so a long-lived Meta token never enters the database or a
+backup.
+
+Everything is scoped by the selected number — the inbox, messages, campaigns and
+stats — while templates are scoped by **WABA**, so two numbers on the same
+WhatsApp Business Account share one template library and numbers on different
+accounts are isolated automatically.
+
+Add or update numbers by editing `config.env` and re-running the seed
+(idempotent, upserts by `phoneNumberId`):
+
+```bash
+npm run seed:numbers
+```
+
+```
+WHATSAPP_NUMBERS=[{"label":"Clinic","phoneNumberId":"...","wabaId":"...",
+                   "displayPhoneNumber":"+971 50 123 4567",
+                   "tokenEnvKey":"WHATSAPP_TOKEN_CLINIC","isDefault":true}]
+WHATSAPP_TOKEN_CLINIC=EAAG...
+WHATSAPP_TOKEN_MARKETING=EAAG...
+```
+
+`tokenEnvKey` must match `WHATSAPP_ACCESS_TOKEN` or `WHATSAPP_TOKEN_*` — it is an
+allow-list enforced when the token is read, so a row cannot be pointed at
+`JWT_SECRET` or any other unrelated secret.
+
+**Requests** carry the selected number in an `X-WhatsApp-Number-Id` header; the
+server resolves the credentials itself and echoes the header back so the client
+can discard a response that arrives after the user switched. **Inbound** webhooks
+route on `metadata.phone_number_id`. **Sockets** join a per-number room at
+handshake, so one line's traffic never reaches an agent working another.
+
+A reply always goes out on the line the customer wrote to, taken from the
+conversation rather than from the request.
 
 ---
 
@@ -186,7 +233,7 @@ Shared helpers used across modules.
 | `whatsappClient.js` | Sends messages via the Meta Cloud API. Supports TEXT, IMAGE, VIDEO, AUDIO, and DOCUMENT by building the correct payload shape for each type. |
 | `cloudinary.js` | Configures and exports the Cloudinary SDK instance using credentials from `config.env`. |
 | `audit.js` | Fire-and-forget helper for writing to the `AuditLog` table. Never blocks the main request. |
-| `seedAdmin.js` | One-time script (`npm run seed`) that creates the default admin account if it does not exist. |
+| `seedUsers.js` | `npm run seed`: creates one account per role (admin, marketing, agent) if missing; never overwrites an existing one. |
 | `cloudinaryTest.js` | One-time onboarding script used to verify the Cloudinary integration. Safe to delete after setup. |
 
 ---
@@ -218,8 +265,10 @@ Empty — kept for potential future top-level route files. All current routes li
 | `DATABASE_URL` | Neon PostgreSQL connection string |
 | `JWT_SECRET` | Secret key for signing JWTs |
 | `WHATSAPP_APP_SECRET` | Used to verify incoming webhook signatures |
-| `WHATSAPP_ACCESS_TOKEN` | Meta API token for sending messages (expires every 24h in test mode) |
-| `WHATSAPP_PHONE_NUMBER_ID` | Meta phone number ID for the sending number |
+| `WHATSAPP_NUMBERS` | JSON array describing each WhatsApp line (see *Multiple WhatsApp numbers*) |
+| `WHATSAPP_TOKEN_*` | Per-number Meta access token, named by that number's `tokenEnvKey` |
+| `WHATSAPP_ACCESS_TOKEN` | Legacy single-number token; still valid as a `tokenEnvKey` |
+| `WHATSAPP_PHONE_NUMBER_ID` | Legacy single-number id — only a bootstrap source for `npm run seed:numbers` |
 | `WHATSAPP_VERIFY_TOKEN` | Token used during webhook verification setup |
 | `CLOUDINARY_CLOUD_NAME` | Cloudinary account cloud name |
 | `CLOUDINARY_API_KEY` | Cloudinary API key |

@@ -17,6 +17,7 @@ const errorHandler = (err, req, res, next) => {
   const statusCode = err.statusCode || 500;
   const response = { success: false, message: err.message || "Internal Server Error" };
   if (err.errorCode) response.code = err.errorCode;
+  if (err.details) response.details = err.details;
 
   if (process.env.NODE_ENV === "development") {
     response.stack = err.stack;

@@ -2,6 +2,12 @@ const bcryptjs = require("bcryptjs");
 const prisma = require("../../config/prisma");
 const AppError = require("../../utils/AppError");
 const logAudit = require("../../utils/audit");
+const { ROLES, roleHasPermission } = require("../../config/permissions");
+
+// Taken from the permission table rather than typed out here. This list was
+// once hard-coded to ADMIN and AGENT, which silently made MARKETING impossible
+// to create even though the rest of the system knew the role.
+const roleError = () => new AppError(`Role must be one of: ${ROLES.join(", ")}`, 400);
 
 const SAFE_SELECT = {
   id: true,
@@ -69,7 +75,7 @@ const createUser = async (req, res, next) => {
     const { name, username, password, role = "AGENT" } = req.body;
     if (!username || !password) return next(new AppError("Username and password are required", 400));
     if (password.length < 8) return next(new AppError("Password must be at least 8 characters", 400));
-    if (!["ADMIN", "AGENT"].includes(role)) return next(new AppError("Role must be ADMIN or AGENT", 400));
+    if (!ROLES.includes(role)) return next(roleError());
 
     const passwordHash = await bcryptjs.hash(password, 12);
     const user = await prisma.user.create({
@@ -101,7 +107,12 @@ const updateUser = async (req, res, next) => {
     if (name !== undefined) data.name = name;
     if (username !== undefined) data.username = username;
     if (role !== undefined) {
-      if (!["ADMIN", "AGENT"].includes(role)) return next(new AppError("Role must be ADMIN or AGENT", 400));
+      if (!ROLES.includes(role)) return next(roleError());
+      // Changing your own role could only ever lock you out of the screen you
+      // are using to change it; another admin has to do it.
+      if (Number(req.params.id) === req.user.id && role !== req.user.role) {
+        return next(new AppError("You can't change your own role — ask another admin", 400));
+      }
       data.role = role;
     }
     if (status !== undefined) {
@@ -188,6 +199,32 @@ const deleteUser = async (req, res, next) => {
 };
 
 // ── Self: get own profile ─────────────────────────────────────────────────────
+// ── Anyone who can assign: who a conversation can be given to ────────────────
+// The agent picker's source. Deliberately not GET /users: that needs user:read,
+// which agents don't have, and it lists deactivated accounts too. This returns
+// only people who can actually work a conversation — active, and a role that
+// can reply — with just enough to pick one (name and presence).
+const PRESENCE_ORDER = { ONLINE: 0, ON_BREAK: 1, OFFLINE: 2 };
+
+const getAssignableUsers = async (req, res, next) => {
+  try {
+    const roles = ROLES.filter((r) => roleHasPermission(r, "conversation:write"));
+    const users = await prisma.user.findMany({
+      where: { isActive: true, role: { in: roles } },
+      select: { id: true, name: true, username: true, status: true },
+    });
+    // Online people first, then by name, so the likeliest hand-off is on top.
+    users.sort(
+      (a, b) =>
+        (PRESENCE_ORDER[a.status] ?? 9) - (PRESENCE_ORDER[b.status] ?? 9) ||
+        (a.name || a.username).localeCompare(b.name || b.username),
+    );
+    res.status(200).json({ success: true, data: users });
+  } catch (err) {
+    next(err);
+  }
+};
+
 const getMe = async (req, res, next) => {
   try {
     const user = await prisma.user.findUnique({
@@ -197,7 +234,15 @@ const getMe = async (req, res, next) => {
         _count: { select: { messages: true, assignedConversations: true } },
       },
     });
-    res.status(200).json({ success: true, data: user });
+    // Serve the permission array config/permissions.js says this endpoint
+    // serves, so the frontend can gate on capabilities instead of re-deriving
+    // them from the role — the one rule that file asks callers to keep.
+    // protect() already resolved it from the authoritative role it just read,
+    // so this costs nothing and cannot disagree with what the guards enforce.
+    res.status(200).json({
+      success: true,
+      data: { ...user, permissions: req.user.permissions },
+    });
   } catch (err) {
     next(err);
   }
@@ -247,6 +292,7 @@ const changeMyPassword = async (req, res, next) => {
 
 module.exports = {
   getAllUsers,
+  getAssignableUsers,
   getUserById,
   createUser,
   updateUser,

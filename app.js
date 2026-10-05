@@ -21,6 +21,11 @@ app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: false 
 app.use(cors({
   origin: process.env.FRONTEND_URL || "http://localhost:3000",
   credentials: true,
+  // The browser can only READ a response header that is explicitly exposed.
+  // The client compares this echo against the number it currently has selected
+  // and discards any response that arrives after a switch, so without this the
+  // whole stale-response guard silently does nothing.
+  exposedHeaders: ["X-WhatsApp-Number-Id"],
 }));
 app.use(cookieParser());
 app.use(express.json({
@@ -57,6 +62,7 @@ app.use("/api/auth", authLimiter, require("./modules/auth/auth.routes"));
 app.use("/api/users", require("./modules/users/user.routes"));
 app.use("/api/customers", require("./modules/customers/customer.routes"));
 app.use("/api/lists", require("./modules/lists/list.routes"));
+app.use("/api/segments", require("./modules/segments/segment.routes"));
 app.use("/api/conversations", require("./modules/conversations/conversation.routes"));
 app.use("/api/messages", require("./modules/messages/message.routes"));
 app.use("/api/media", require("./modules/media/media.routes"));
@@ -67,6 +73,10 @@ app.use("/api/stats", require("./modules/stats/stats.routes"));
 app.use("/api/templates", require("./modules/templates/template.routes"));
 app.use("/api/campaigns", require("./modules/campaigns/campaign.routes"));
 app.use("/api/whatsapp", require("./modules/whatsapp-status/whatsappStatus.routes"));
+// Dev-only tools (message/cost tracker). Never mounted in production.
+if (process.env.NODE_ENV !== "production") {
+  app.use("/api/dev", require("./modules/dev/dev.routes"));
+}
 
 app.use(errorHandler);
 
