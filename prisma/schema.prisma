@@ -16,6 +16,8 @@ enum Role {
 enum SenderType {
   CUSTOMER
   AGENT
+  // Sent by a Flow (automation) — no human sender, senderId is null.
+  BOT
 }
 
 enum MessageType {
@@ -26,12 +28,28 @@ enum MessageType {
   DOCUMENT
   INTERACTIVE
   STICKER
+  // A Meta-approved template send (utils/templateSend.js). Distinct from
+  // INTERACTIVE, which is an ad-hoc message only accepted inside the 24-hour
+  // window — the difference matters to the window guard and to reporting.
+  TEMPLATE
 }
 
 enum TemplateCategory {
   GENERAL
   RE_ENGAGEMENT
   CAMPAIGN
+}
+
+// Why a campaign was sent. Separate from TemplateCategory, which is the message
+// type and drives Meta billing — every campaign template is CAMPAIGN there.
+enum CampaignCategory {
+  PROMOTION
+  SEASONAL
+  EVENT
+  AWARENESS
+  FOLLOW_UP
+  ANNOUNCEMENT
+  OTHER
 }
 
 enum TemplateHeaderType {
@@ -71,11 +89,24 @@ enum AgentStatus {
 
 enum CampaignStatus {
   DRAFT
+  PENDING_APPROVAL
   SCHEDULED
   RUNNING
   PAUSED
   COMPLETED
   CANCELLED
+}
+
+// Why a campaign is PAUSED. The scheduler auto-resumes only QUIET_HOURS —
+// never a campaign a person paused, or one whose number went inactive.
+enum CampaignPauseReason {
+  MANUAL
+  QUIET_HOURS
+  NUMBER_INACTIVE
+  // Meta refused a send for a reason that would fail every recipient (token,
+  // payment, template problem, rate limit). Paused instead of burning the
+  // audience; the recipients stay PENDING and Resume retries them.
+  SEND_ERROR
 }
 
 enum CampaignRecipientStatus {
@@ -97,6 +128,68 @@ enum MediaAssetType {
   DOCUMENT
 }
 
+// One WhatsApp sending line. Everything the app sends with — the Meta phone
+// number id and the token that can reach it — is resolved from a row here, never
+// from the environment directly.
+//
+// The access TOKEN itself is deliberately NOT stored. `tokenEnvKey` names an
+// environment variable, so a long-lived Meta token never enters Postgres or any
+// database backup. utils/whatsappNumbers.js enforces an allow-list on that name
+// at READ time: without it, a row could point this at JWT_SECRET or DATABASE_URL
+// and any error path that echoes credentials becomes an exfiltration channel.
+model WhatsAppNumber {
+  id                 Int      @id @default(autoincrement())
+  // What the switcher shows, e.g. "Clinic" / "Marketing".
+  label              String
+  phoneNumberId      String   @unique
+  wabaId             String
+  displayPhoneNumber String?
+  tokenEnvKey        String
+  // Meta App id, for the resumable-upload API used when submitting a template
+  // with a media header. Null falls back to WHATSAPP_APP_ID — only needed if a
+  // WABA ever sits under a second Meta App.
+  appId              String?
+  // Meta rate-limits per NUMBER, so in-flight sends are capped per number rather
+  // than per process. Numbers sit at different throughput tiers, so this is a
+  // column and not a shared constant.
+  sendConcurrency    Int      @default(5)
+  // Gates SENDING only. An inactive number still accepts inbound messages — the
+  // line exists and a patient may still be talking on it.
+  isActive           Boolean  @default(true)
+  isDefault          Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  conversations Conversation[]
+  campaigns     Campaign[]
+  optOuts       CustomerOptOut[]
+
+  @@index([wabaId])
+  @@index([isActive])
+}
+
+// Per-number consent. A STOP sent to the marketing line must not silence the
+// clinic's appointment reminders, so keyword opt-out is recorded against the
+// number that received it rather than against the customer as a whole.
+//
+// This does NOT replace Customer.optedOut, which remains a global do-not-contact
+// switch set by an admin or an import. The send path checks both.
+model CustomerOptOut {
+  id               Int            @id @default(autoincrement())
+  customerId       Int
+  customer         Customer       @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  whatsappNumberId Int
+  whatsappNumber   WhatsAppNumber @relation(fields: [whatsappNumberId], references: [id], onDelete: Cascade)
+  // "KEYWORD" | "MANUAL" | "IMPORT" | "WHATSAPP" — WHATSAPP is the customer
+  // stopping "Offers and announcements" in WhatsApp itself (user_preferences
+  // webhook, or Meta failing a send with 131050).
+  source           String
+  optedOutAt       DateTime       @default(now())
+
+  @@unique([customerId, whatsappNumberId])
+  @@index([whatsappNumberId])
+}
+
 model User {
   id                    Int            @id @default(autoincrement())
   name                  String?
@@ -113,9 +206,13 @@ model User {
   updatedAt             DateTime       @updatedAt
   messages              Message[]
   assignedConversations Conversation[] @relation("AssignedConversations")
-  campaigns             Campaign[]
+  campaigns             Campaign[]     @relation("CreatedCampaigns")
+  submittedCampaigns    Campaign[]     @relation("SubmittedCampaigns")
+  reviewedCampaigns     Campaign[]     @relation("ReviewedCampaigns")
   contactLists          ContactList[]
+  segments              Segment[]
   mediaAssets           MediaAsset[]
+  flows                 Flow[]
 }
 
 model MediaAsset {
@@ -148,11 +245,17 @@ model Customer {
   departments        String[]            @default([]) // ordered by rank: index 0 = top department
   tags               String[]            @default([])
   notes              String?
+  // Global do-not-contact, set manually or by import. Distinct from CustomerOptOut,
+  // which records a STOP received on one specific number. The send path must
+  // check BOTH — this one suppresses every line.
   optedOut           Boolean             @default(false)
   createdAt          DateTime            @default(now())
-  conversation       Conversation?
+  // One conversation per number the customer has talked to, not one overall.
+  conversations      Conversation[]
+  optOuts            CustomerOptOut[]
   campaignRecipients CampaignRecipient[]
   listMemberships    ListMember[]
+  flowRuns           FlowRun[]
 }
 
 model ContactList {
@@ -164,6 +267,33 @@ model ContactList {
   members     ListMember[]
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
+}
+
+// A saved audience RULE, not a saved audience. `definition` holds
+// { match, rules } and is re-evaluated every time the segment is used, so a
+// patient who becomes eligible tomorrow is included tomorrow — the thing a
+// ContactList structurally cannot do, since its membership is frozen the
+// moment it is built.
+//
+// The rule grammar and its compilation to a Prisma `where` live in
+// utils/segmentFilter.js; nothing else is allowed to interpret this column.
+model Segment {
+  id              Int        @id @default(autoincrement())
+  name            String
+  description     String?
+  definition      Json
+  // Segments are built for marketing sends, so consent exclusion is on by
+  // default. It can be turned off for an operational audience (a service
+  // notice, an export), but the campaign send path forces it back on
+  // regardless of what is stored here.
+  excludeOptedOut Boolean    @default(true)
+  createdById     Int?
+  createdBy       User?      @relation(fields: [createdById], references: [id])
+  campaigns       Campaign[]
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  @@index([createdById])
 }
 
 model ListMember {
@@ -178,60 +308,105 @@ model ListMember {
   @@index([customerId])
 }
 
+// A thread between one customer and ONE of our numbers. A customer who messages
+// two of our lines has two conversations, each with its own 24-hour window —
+// which is why customerId is no longer unique on its own.
 model Conversation {
-  id              Int                @id @default(autoincrement())
-  customerId      Int                @unique
-  customer        Customer           @relation(fields: [customerId], references: [id])
-  assignedAgentId Int?
-  assignedAgent   User?              @relation("AssignedConversations", fields: [assignedAgentId], references: [id])
-  status          ConversationStatus @default(OPEN)
-  unreadCount     Int                @default(0)
+  id                    Int                @id @default(autoincrement())
+  customerId            Int
+  customer              Customer           @relation(fields: [customerId], references: [id])
+  whatsappNumberId      Int
+  whatsappNumber        WhatsAppNumber     @relation(fields: [whatsappNumberId], references: [id])
+  assignedAgentId       Int?
+  assignedAgent         User?              @relation("AssignedConversations", fields: [assignedAgentId], references: [id])
+  status                ConversationStatus @default(OPEN)
+  unreadCount           Int                @default(0)
   lastMessage           String?
   lastMessageAt         DateTime?
   lastSenderType        SenderType?
   lastCustomerMessageAt DateTime?
-  createdAt       DateTime           @default(now())
-  updatedAt       DateTime           @updatedAt
-  messages        Message[]
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+  messages              Message[]
+  flowRuns              FlowRun[]
 
-  @@index([lastMessageAt, lastSenderType, status])
-  @@index([assignedAgentId, status])
+  // The composite unique is what `upsert` keys on in the webhook path, and what
+  // permits a second conversation for the same customer on a different number.
+  @@unique([customerId, whatsappNumberId])
+  // Every inbox list and count now carries a whatsappNumberId equality predicate,
+  // so it leads each index — the difference between an index scan and a filter
+  // over the whole table once several numbers share it.
+  @@index([whatsappNumberId, lastMessageAt, lastSenderType, status])
+  @@index([whatsappNumberId, assignedAgentId, status])
+  @@index([whatsappNumberId, status])
 }
 
 model Message {
-  id                Int            @id @default(autoincrement())
-  conversationId    Int
-  conversation      Conversation   @relation(fields: [conversationId], references: [id])
-  senderType        SenderType
-  senderId          Int?
-  sender            User?          @relation(fields: [senderId], references: [id])
-  content           String
-  messageType       MessageType    @default(TEXT)
-  whatsappMessageId String?
-  mediaId           String?
-  mediaUrl          String?
-  status            MessageStatus?
-  reactions         Json?
-  quotedMessageId   Int?
-  quotedMessage     Message?       @relation("QuotedMessages", fields: [quotedMessageId], references: [id])
-  quotingMessages   Message[]      @relation("QuotedMessages")
-  deletedAt         DateTime?
-  createdAt         DateTime       @default(now())
-  updatedAt         DateTime       @updatedAt
+  id                  Int                 @id @default(autoincrement())
+  conversationId      Int
+  conversation        Conversation        @relation(fields: [conversationId], references: [id])
+  senderType          SenderType
+  senderId            Int?
+  sender              User?               @relation(fields: [senderId], references: [id])
+  content             String
+  messageType         MessageType         @default(TEXT)
+  whatsappMessageId   String?
+  mediaId             String?
+  mediaUrl            String?
+  status              MessageStatus?
+  // Meta's billing verdict, copied from the `pricing` block of the status
+  // webhook. Null until Meta reports it. billable is the authority on whether
+  // this message cost money; pricingCategory is marketing / utility /
+  // authentication / service, pricingType regular / free_customer_service.
+  billable            Boolean?
+  pricingCategory     String?
+  pricingType         String?
+  // Why Meta failed the send (from the status webhook's errors[0]). 131042 is
+  // a payment-method problem on the WhatsApp account.
+  errorCode           Int?
+  errorTitle          String?
+  reactions           Json?
+  quotedMessageId     Int?
+  quotedMessage       Message?            @relation("QuotedMessages", fields: [quotedMessageId], references: [id])
+  quotingMessages     Message[]           @relation("QuotedMessages")
+  // Set on an INBOUND message that answers a campaign: the recipient row it
+  // replies to, which gives both the campaign and who was sent it. See the
+  // attribution rule in modules/webhooks/webhook.controller.js. Null for every
+  // other message.
+  campaignRecipientId Int?
+  campaignRecipient   CampaignRecipient?  @relation("RecipientReplies", fields: [campaignRecipientId], references: [id], onDelete: SetNull)
+  // The recipient rows this message was the campaign SEND for (the inverse of
+  // CampaignRecipient.message).
+  sentForRecipients   CampaignRecipient[] @relation("RecipientSentMessage")
+  deletedAt           DateTime?
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
 
   @@index([conversationId, createdAt])
   @@index([whatsappMessageId])
   @@index([senderType, createdAt])
+  @@index([campaignRecipientId])
 }
 
+// Templates belong to a WABA, not to a number. Numbers sharing a WABA therefore
+// share this library automatically, and numbers on separate WABAs are isolated
+// automatically — one code path covers both topologies.
 model Template {
   id               Int                    @id @default(autoincrement())
+  // Which WhatsApp Business Account this template was created under. Assigned at
+  // creation from the active number and never editable afterwards: a template
+  // approved on one WABA cannot be sent from a number on another, because Meta
+  // rejects the template name as unknown.
+  wabaId           String
   name             String
   metaTemplateName String?
   metaTemplateId   String?
   category         TemplateCategory       @default(GENERAL)
   approvalStatus   TemplateApprovalStatus @default(DRAFT)
   rejectionReason  String?
+  // When Meta last approved or rejected it. Drives the "approved since your
+  // last visit" badge; null until Meta decides.
+  statusChangedAt  DateTime?
   language         String                 @default("en_US")
   headerType       TemplateHeaderType     @default(NONE)
   header           String?
@@ -239,46 +414,105 @@ model Template {
   body             String
   footer           String?
   buttons          Json?
+  // Present = a carousel template: the body is the text above 2–10 swipeable
+  // cards, and header/footer/buttons are unused. Each card is
+  // { mediaType: IMAGE|VIDEO, mediaUrl, body, buttons: [{ id, type, title, url? }] }
+  // — see validateCards in modules/templates/template.controller.js.
+  cards            Json?
   isActive         Boolean                @default(true)
   createdAt        DateTime               @default(now())
   updatedAt        DateTime               @updatedAt
   campaigns        Campaign[]
+
+  // Meta enforces template-name uniqueness per WABA. Postgres permits unlimited
+  // NULLs in a unique index, so DRAFT templates — which have no metaTemplateName
+  // until submitForApproval writes one — are unaffected.
+  @@unique([wabaId, metaTemplateName])
+  @@index([wabaId, isActive])
 }
 
 model Campaign {
-  id              Int                 @id @default(autoincrement())
-  name            String
-  templateId      Int
-  template        Template            @relation(fields: [templateId], references: [id])
-  status          CampaignStatus      @default(DRAFT)
-  scheduledAt     DateTime?
-  startedAt       DateTime?
-  completedAt     DateTime?
-  sentCount       Int                 @default(0)
-  failedCount     Int                 @default(0)
-  totalRecipients Int                 @default(0)
-  createdById     Int
-  createdBy       User                @relation(fields: [createdById], references: [id])
-  recipients      CampaignRecipient[]
-  createdAt       DateTime            @default(now())
-  updatedAt       DateTime            @updatedAt
+  id               Int                  @id @default(autoincrement())
+  name             String
+  templateId       Int
+  template         Template             @relation(fields: [templateId], references: [id])
+  // Business purpose, for filtering and reporting. Not the Meta billing
+  // category — that lives on Template.
+  category         CampaignCategory     @default(OTHER)
+  // Which line this campaign sends from. Persisted rather than taken from the
+  // request because the scheduler (jobs/campaignScheduler.js) runs on a cron tick
+  // with no HTTP request, no user and no headers — the campaign row is the only
+  // place it can learn the number. Set at creation, immutable once out of DRAFT.
+  whatsappNumberId Int
+  whatsappNumber   WhatsAppNumber       @relation(fields: [whatsappNumberId], references: [id])
+  status           CampaignStatus       @default(DRAFT)
+  pauseReason      CampaignPauseReason?
+  // Human-readable reason for the pause (e.g. Meta's error), shown on the card.
+  pauseDetail      String?
+  scheduledAt      DateTime?
+  startedAt        DateTime?
+  completedAt      DateTime?
+  sentCount        Int                  @default(0)
+  failedCount      Int                  @default(0)
+  totalRecipients  Int                  @default(0)
+  // Audience provenance. When a campaign is built from a segment, the segment
+  // is resolved to concrete CampaignRecipient rows AT CREATION and frozen
+  // there — the rule may keep evolving, but this campaign's audience does not.
+  // These two columns record which rule produced it and what it looked like at
+  // the time, so an approver can answer "who exactly did this go to, and why"
+  // long after the segment has been edited.
+  segmentId        Int?
+  segment          Segment?             @relation(fields: [segmentId], references: [id], onDelete: SetNull)
+  audienceSnapshot Json?
+  createdById      Int
+  createdBy        User                 @relation("CreatedCampaigns", fields: [createdById], references: [id])
+  // Approval trail. An agent may build a DRAFT and submit it; only an ADMIN
+  // can approve, and approving IS the send authorization — a campaign is
+  // immutable to agents from PENDING_APPROVAL onward, so the recipient list
+  // can't change after review.
+  submittedById    Int?
+  submittedBy      User?                @relation("SubmittedCampaigns", fields: [submittedById], references: [id])
+  submittedAt      DateTime?
+  reviewedById     Int?
+  reviewedBy       User?                @relation("ReviewedCampaigns", fields: [reviewedById], references: [id])
+  reviewedAt       DateTime?
+  rejectionReason  String?
+  // Optional automation that answers taps on this campaign's template buttons.
+  flowId           Int?
+  flow             Flow?                @relation(fields: [flowId], references: [id], onDelete: SetNull)
+  flowRuns         FlowRun[]
+  recipients       CampaignRecipient[]
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
 
-  @@index([status])
+  @@index([whatsappNumberId, status])
+  @@index([whatsappNumberId, category])
+  @@index([status, pauseReason])
 }
 
 model CampaignRecipient {
-  id          Int                     @id @default(autoincrement())
-  campaignId  Int
-  campaign    Campaign                @relation(fields: [campaignId], references: [id], onDelete: Cascade)
-  customerId  Int
-  customer    Customer                @relation(fields: [customerId], references: [id])
-  status      CampaignRecipientStatus @default(PENDING)
-  messageId   Int?
-  error       String?
-  sentAt      DateTime?
-  createdAt   DateTime                @default(now())
+  id         Int                     @id @default(autoincrement())
+  campaignId Int
+  campaign   Campaign                @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  customerId Int
+  customer   Customer                @relation(fields: [customerId], references: [id])
+  status     CampaignRecipientStatus @default(PENDING)
+  // The message the campaign SENT this recipient. Now a real foreign key; it was
+  // a bare integer joined only in raw SQL.
+  messageId  Int?
+  message    Message?                @relation("RecipientSentMessage", fields: [messageId], references: [id], onDelete: SetNull)
+  error      String?
+  sentAt     DateTime?
+  // When this recipient first replied to the campaign. Set once, by the webhook,
+  // and never moved — it is what "Replied" counts.
+  repliedAt  DateTime?
+  replies    Message[]               @relation("RecipientReplies")
+  createdAt  DateTime                @default(now())
 
   @@index([campaignId])
+  // Serves the webhook's attribution lookup: this customer's recent campaigns.
+  @@index([customerId, sentAt])
+  @@index([messageId])
 }
 
 model AuditLog {
@@ -294,4 +528,63 @@ model AuditLog {
   @@index([targetType, targetId])
   @@index([actorId])
   @@index([createdAt])
+}
+
+// ─── Flows (campaign automation) ─────────────────────────────────────────────
+// A Flow is a saved graph: a trigger (the campaign template's buttons) and the
+// steps that follow — messages with buttons, lists, questions that collect
+// data, tags, hand-off to an agent. `graph` is { nodes, edges } in the shape
+// the builder (React Flow) edits; utils/flowGraph.js validates it on save and
+// utils/flowEngine.js walks it.
+model Flow {
+  id          Int        @id @default(autoincrement())
+  name        String
+  description String?
+  isActive    Boolean    @default(true)
+  graph       Json
+  createdById Int
+  createdBy   User       @relation(fields: [createdById], references: [id])
+  campaigns   Campaign[]
+  runs        FlowRun[]
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+}
+
+enum FlowRunStatus {
+  // Executing or waiting for the customer's next tap/answer.
+  ACTIVE
+  COMPLETED
+  // An agent took over (an Assign step, or an agent replied by hand).
+  HANDED_OFF
+  // The customer opted out, or a newer run replaced this one.
+  STOPPED
+  // No answer within the 24-hour window.
+  EXPIRED
+  FAILED
+}
+
+// One customer going through one flow. `data` is what the flow collected:
+// { answers: { <variable>: value }, path: [{ node, choice, at }] } — the
+// "responses" a flow's results page lists and exports.
+model FlowRun {
+  id             Int           @id @default(autoincrement())
+  flowId         Int
+  flow           Flow          @relation(fields: [flowId], references: [id], onDelete: Cascade)
+  conversationId Int
+  conversation   Conversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  customerId     Int
+  customer       Customer      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  campaignId     Int?
+  campaign       Campaign?     @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  status         FlowRunStatus @default(ACTIVE)
+  // The step waiting for input; null once the run has finished.
+  currentNodeId  String?
+  data           Json          @default("{}")
+  lastError      String?
+  startedAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  completedAt    DateTime?
+
+  @@index([conversationId, status])
+  @@index([flowId, startedAt])
 }
