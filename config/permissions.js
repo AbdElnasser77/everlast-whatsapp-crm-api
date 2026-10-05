@@ -34,6 +34,12 @@ const ALL_PERMISSIONS = [
   // Contact lists
   "list:read",
   "list:write",
+  // Segments. Split read/write for the same reason as lists: an agent picking
+  // an audience to look at is a different act from authoring the rule a
+  // campaign will be sent to. Preview and member listing are reads, so they sit
+  // under segment:read rather than earning names of their own.
+  "segment:read",
+  "segment:write",
   // Templates
   "template:read",
   "template:write",
@@ -52,7 +58,20 @@ const ALL_PERMISSIONS = [
   // Reporting / ops
   "stats:read",
   "audit:read",
+  // The Dok32 clinic-day board (served by n8n). Separate from stats:read
+  // because it shows patient names and appointments, which MARKETING's
+  // reporting access shouldn't include. ADMIN only, via "*".
+  "clinic:read",
+  // WhatsApp numbers. `number:read` lists them (every role needs it to render
+  // the switcher). `number:use_any` is permission to act as any active number —
+  // granted broadly in v1, and the single hook a future per-user number
+  // assignment would tighten. `number:write` is CRUD on the numbers themselves.
   "number:read",
+  "number:use_any",
+  "number:write",
+  // Development tools (the message/cost tracker). ADMIN only, via "*"; the
+  // /api/dev routes also don't exist in production at all.
+  "dev:tools",
 ];
 
 // ADMIN is the wildcard "*" rather than an enumerated list on purpose: in this
@@ -75,11 +94,15 @@ const ROLE_PERMISSIONS = {
     // admin-shaped. Single-contact delete covers hygiene.
     "contact:read", "contact:write", "contact:import", "contact:delete",
     "list:read", "list:write",
+    // The segmentation engine is this role's core tool: defining who a campaign
+    // goes to is the job. Granting write here is what stops "audience" being an
+    // admin-only bottleneck on every send.
+    "segment:read", "segment:write",
     "template:read", "template:write",
     "campaign:read", "campaign:write", "campaign:send", "campaign:control",
     "media:read", "media:write",
     "user:read", // agent names for reporting filters; user:write stays ADMIN
-    "stats:read", "audit:read", "number:read",
+    "stats:read", "audit:read", "number:read", "number:use_any",
   ],
 
   AGENT: [
@@ -89,10 +112,24 @@ const ROLE_PERMISSIONS = {
     // or fix a wrong number. Imports and bulk delete are not granted.
     "contact:read", "contact:write",
     "list:read",
+    // Read-only, exactly as with lists: an agent may look at an audience while
+    // working a conversation, but authoring the rule a bulk send targets is not
+    // theirs to do.
+    "segment:read",
     // Load-bearing: this is what lets an agent pick a template to send inside a
     // conversation. Template *administration* is template:write.
     "template:read",
+    // No campaign permissions. The server supports an agent drafting a campaign
+    // and submitting it for approval (the controller limits anyone with
+    // campaign:write but not campaign:send to their own DRAFTs), but the
+    // frontend has no submit / approve / reject screens yet — granting
+    // campaign:write here would let agents build drafts nobody can approve.
+    // Add "campaign:read", "campaign:write" once those screens exist.
     "media:upload", "media:read",
+    // An agent must be able to see and act as whichever line a customer wrote
+    // to; without these, inbound conversations on a number they aren't "on"
+    // would be unanswerable.
+    "number:read", "number:use_any",
   ],
 };
 

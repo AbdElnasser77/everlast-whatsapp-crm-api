@@ -1,7 +1,7 @@
 const express = require("express");
 const multer = require("multer");
 const protect = require("../../middleware/auth");
-const requireRole = require("../../middleware/roles");
+const requirePermission = require("../../middleware/permissions");
 const { getAllMedia, uploadMedia, updateMedia, deleteMedia } = require("./mediaLibrary.controller");
 const { MAX_FILE_SIZE, mediaFileFilter } = require("../../utils/mediaHelpers");
 
@@ -15,9 +15,9 @@ const router = express.Router();
 
 router.use(protect);
 
-router.get("/", getAllMedia);
-router.post("/", requireRole("ADMIN"), upload.single("file"), uploadMedia);
-router.put("/:id", requireRole("ADMIN"), updateMedia);
-router.delete("/:id", requireRole("ADMIN"), deleteMedia);
+router.get("/", requirePermission("media:read"), getAllMedia);
+router.post("/", requirePermission("media:write"), upload.single("file"), uploadMedia);
+router.put("/:id", requirePermission("media:write"), updateMedia);
+router.delete("/:id", requirePermission("media:write"), deleteMedia);
 
 module.exports = router;
