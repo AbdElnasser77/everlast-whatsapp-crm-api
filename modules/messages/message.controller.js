@@ -2,7 +2,11 @@ const prisma = require("../../config/prisma");
 const AppError = require("../../utils/AppError");
 const { sendWhatsAppMessage } = require("../../utils/whatsappClient");
 const { fetchAndStoreMedia } = require("../../utils/whatsappMedia");
-const { getIO } = require("../../utils/socket");
+const { emitToNumber } = require("../../utils/socket");
+const { claimIfUnassigned } = require("../../utils/conversationAssignment");
+const { windowState, windowClosedError } = require("../../utils/messagingWindow");
+const numbers = require("../../utils/whatsappNumbers");
+const { handOffOnAgentReply } = require("../../utils/flowEngine");
 
 const sendMessage = async (req, res, next) => {
   try {
@@ -18,15 +22,26 @@ const sendMessage = async (req, res, next) => {
     });
     if (!conversation) return next(new AppError("Conversation not found", 404));
 
-    if (conversation.lastCustomerMessageAt) {
-      const elapsed = Date.now() - new Date(conversation.lastCustomerMessageAt).getTime();
-      if (elapsed > 86_400_000) {
-        return res.status(400).json({
-          success: false,
-          error: "WINDOW_CLOSED",
-          message: "The 24-hour messaging window has expired. Use a template to re-engage.",
-        });
-      }
+    // The number comes from the CONVERSATION, not from the request. A customer
+    // who wrote to the clinic line must be answered on the clinic line — sending
+    // the reply from whichever number the agent happens to have selected would
+    // start a second thread on the customer's phone.
+    if (conversation.whatsappNumberId !== req.numberId) {
+      return next(
+        new AppError(
+          "This conversation belongs to a different WhatsApp number — switch to it to reply",
+          409,
+          "NUMBER_MISMATCH",
+        ),
+      );
+    }
+    const credentials = await numbers.getCredentials(conversation.whatsappNumberId);
+
+    // Free-form messages only inside the 24-hour window — and a contact who has
+    // never written is OUTSIDE it (see utils/messagingWindow.js). That case used
+    // to be let through, and Meta then rejected the send.
+    if (!windowState(conversation.lastCustomerMessageAt).open) {
+      return next(windowClosedError(conversation.lastCustomerMessageAt));
     }
 
     const messageContent = content || mediaUrl;
@@ -62,6 +77,7 @@ const sendMessage = async (req, res, next) => {
 
     try {
       const { whatsappMessageId } = await sendWhatsAppMessage({
+        number: credentials,
         to: conversation.customer.phone,
         content,
         messageType,
@@ -100,9 +116,17 @@ const sendMessage = async (req, res, next) => {
       },
     });
 
-    const io = getIO();
-    io.emit("message.created", { message, conversationId: parseInt(conversationId) });
-    io.emit("conversation.updated", { conversationId: parseInt(conversationId) });
+    // Replying to an unassigned chat takes it, so it leaves the Unassigned queue
+    // and nobody else picks it up too. Only on a successful send: a failed send
+    // shouldn't quietly take ownership.
+    if (message.status === "SENT") {
+      await claimIfUnassigned({ conversationId: parseInt(conversationId), numberId: conversation.whatsappNumberId, user: req.user });
+      // A person is talking now: any flow in this chat steps aside.
+      await handOffOnAgentReply(parseInt(conversationId));
+    }
+
+    emitToNumber(conversation.whatsappNumberId, "message.created", { message, conversationId: parseInt(conversationId) });
+    emitToNumber(conversation.whatsappNumberId, "conversation.updated", { conversationId: parseInt(conversationId) });
 
     res.status(201).json({ success: true, data: message });
   } catch (err) {
@@ -119,7 +143,12 @@ const searchMessages = async (req, res, next) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
     const skip = (page - 1) * limit;
 
-    const where = { content: { contains: q, mode: "insensitive" } };
+    // Message has no number column of its own — it reaches one through its
+    // conversation, which keeps the largest table in the schema normalized.
+    const where = {
+      content: { contains: q, mode: "insensitive" },
+      conversation: { whatsappNumberId: req.numberId },
+    };
     if (conversationId) where.conversationId = parseInt(conversationId);
 
     const [messages, total] = await Promise.all([
@@ -146,9 +175,14 @@ const getMessageMedia = async (req, res, next) => {
   try {
     const message = await prisma.message.findUnique({
       where: { id: parseInt(req.params.id) },
+      include: { conversation: { select: { whatsappNumberId: true } } },
     });
 
-    if (!message) return next(new AppError("Message not found", 404));
+    // Without this check, anyone could fetch another number's media by guessing
+    // a message id — the ids are global integers.
+    if (!message || message.conversation.whatsappNumberId !== req.numberId) {
+      return next(new AppError("Message not found", 404));
+    }
     if (!message.mediaId && !message.mediaUrl) return next(new AppError("This message has no media", 404));
 
     // Already stored — redirect straight to the permanent storage URL.
@@ -164,6 +198,7 @@ const getMessageMedia = async (req, res, next) => {
         messageId: message.id,
         mediaId: message.mediaId,
         messageType: message.messageType,
+        whatsappNumberId: message.conversation.whatsappNumberId,
       });
       res.setHeader("Content-Type", mimetype || "application/octet-stream");
       res.setHeader("Cache-Control", "private, max-age=3600");
@@ -189,9 +224,14 @@ const deleteMessage = async (req, res, next) => {
     const id = parseInt(req.params.id);
     const message = await prisma.message.findUnique({
       where: { id },
-      select: { id: true, conversationId: true, senderType: true, senderId: true, deletedAt: true },
+      select: {
+        id: true, conversationId: true, senderType: true, senderId: true, deletedAt: true,
+        conversation: { select: { whatsappNumberId: true } },
+      },
     });
-    if (!message) return next(new AppError("Message not found", 404));
+    if (!message || message.conversation.whatsappNumberId !== req.numberId) {
+      return next(new AppError("Message not found", 404));
+    }
     if (message.senderType !== "AGENT") {
       return next(new AppError("Customer messages cannot be deleted", 403));
     }
@@ -204,7 +244,10 @@ const deleteMessage = async (req, res, next) => {
         where: { id },
         data: { deletedAt: new Date(), content: "", mediaUrl: null, mediaId: null },
       });
-      getIO().emit("message.deleted", { messageId: id, conversationId: message.conversationId });
+      emitToNumber(message.conversation.whatsappNumberId, "message.deleted", {
+        messageId: id,
+        conversationId: message.conversationId,
+      });
     }
 
     res.status(200).json({ success: true });

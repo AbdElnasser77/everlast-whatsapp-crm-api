@@ -13,7 +13,15 @@ function buildInteractiveHeader(headerType, header, headerMediaUrl) {
   return null;
 }
 
+/**
+ * Sends one WhatsApp message.
+ *
+ * @param number  REQUIRED resolved credentials from utils/whatsappNumbers.js
+ *                getCredentials() — { phoneNumberId, accessToken }. Passed in
+ *                rather than looked up so this function stays free of DB I/O.
+ */
 const sendWhatsAppMessage = async ({
+  number,
   to,
   content,
   messageType = "TEXT",
@@ -26,10 +34,24 @@ const sendWhatsAppMessage = async ({
   templateName = null,
   language = "en_US",
   templateVariables = [],
+  headerVariables = [],
   quotedWhatsappMessageId = null,
+  // INTERACTIVE list message: { buttonLabel, rows: [{ id, title, description? }] }.
+  // Takes precedence over `buttons`. Header may only be text on a list.
+  list = null,
+  // TEMPLATE carousel: [{ mediaType, mediaUrl, quickReplyPayloads: [payload|null] }]
+  carouselCards = null,
 }) => {
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-  const accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+  // No environment fallback, deliberately. A fallback would mean a call site
+  // that forgot to pass `number` keeps silently sending from whichever line the
+  // env happens to name — messages going out from the wrong number, with
+  // nothing in the logs to say so. Failing loudly is the only safe default.
+  if (!number || !number.phoneNumberId || !number.accessToken) {
+    throw new Error(
+      "sendWhatsAppMessage: `number` is required — pass resolved credentials from whatsappNumbers.getCredentials()",
+    );
+  }
+  const { phoneNumberId, accessToken } = number;
 
   const payload = {
     messaging_product: "whatsapp",
@@ -66,7 +88,20 @@ const sendWhatsAppMessage = async ({
       const singleUrlButton = list.length === 1 && list[0].type === "URL";
 
       payload.type = "interactive";
-      if (allQuickReply) {
+      if (list) {
+        payload.interactive = {
+          type: "list",
+          ...(headerType === "TEXT" && header && { header: { type: "text", text: header } }),
+          body: { text: content },
+          ...(footer && { footer: { text: footer } }),
+          action: {
+            button: list.buttonLabel,
+            sections: [{
+              rows: list.rows.map((r) => ({ id: r.id, title: r.title, ...(r.description && { description: r.description }) })),
+            }],
+          },
+        };
+      } else if (allQuickReply) {
         payload.interactive = {
           type: "button",
           ...(interactiveHeader && { header: interactiveHeader }),
@@ -105,6 +140,8 @@ const sendWhatsAppMessage = async ({
       if (["IMAGE", "VIDEO", "DOCUMENT"].includes(headerType) && headerMediaUrl) {
         const key = headerType.toLowerCase();
         components.push({ type: "header", parameters: [{ type: key, [key]: { link: headerMediaUrl } }] });
+      } else if (headerType === "TEXT" && headerVariables.length) {
+        components.push({ type: "header", parameters: headerVariables.map((v) => ({ type: "text", text: v })) });
       }
       if (templateVariables.length) {
         components.push({ type: "body", parameters: templateVariables.map((v) => ({ type: "text", text: v })) });
@@ -115,6 +152,23 @@ const sendWhatsAppMessage = async ({
       // requires resolving the button's own variable (distinct from the body
       // vars) which isn't modeled yet, so it's intentionally left as-is
       // rather than guessing a value.
+      if (carouselCards && carouselCards.length) {
+        components.push({
+          type: "carousel",
+          cards: carouselCards.map((c, i) => {
+            const key = c.mediaType.toLowerCase();
+            return {
+              card_index: i,
+              components: [
+                { type: "header", parameters: [{ type: key, [key]: { link: c.mediaUrl } }] },
+                ...c.quickReplyPayloads
+                  .map((p, j) => (p ? { type: "button", sub_type: "quick_reply", index: String(j), parameters: [{ type: "payload", payload: p }] } : null))
+                  .filter(Boolean),
+              ],
+            };
+          }),
+        });
+      }
       payload.template = { name: templateName, language: { code: language }, components };
       break;
     }

@@ -1,7 +1,8 @@
 const axios = require("axios");
 const prisma = require("../config/prisma");
 const storage = require("./storage");
-const { getIO } = require("./socket");
+const { emitToNumber } = require("./socket");
+const numbers = require("./whatsappNumbers");
 
 const API_VERSION = process.env.WHATSAPP_API_VERSION || "v19.0";
 
@@ -15,11 +16,29 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // *id itself* stays downloadable for as long as Meta retains the file (days).
 // So a failed background upload can always be recovered later by calling this
 // again with the stored mediaId — that's what makes "just redownload it" work.
-async function fetchAndStoreMedia({ messageId, mediaId, messageType }) {
+//
+// `whatsappNumberId` is optional: the webhook path already knows it, while the
+// on-demand recovery path does not. When absent it is resolved from the
+// message's conversation, which makes it impossible to call this with a token
+// that cannot reach the media — a media id issued to one WABA is not readable
+// with another WABA's token.
+async function fetchAndStoreMedia({ messageId, mediaId, messageType, whatsappNumberId = null }) {
+  let numberId = whatsappNumberId;
+  if (!numberId) {
+    const row = await prisma.message.findUnique({
+      where: { id: messageId },
+      select: { conversation: { select: { whatsappNumberId: true } } },
+    });
+    numberId = row?.conversation?.whatsappNumberId ?? null;
+  }
+  if (!numberId) throw new Error(`Cannot resolve a WhatsApp number for message ${messageId}`);
+
+  const { accessToken } = await numbers.getCredentials(numberId);
+
   // 1. Fresh temporary download URL + the file's real mimetype from Meta.
   const metaRes = await axios.get(
     `https://graph.facebook.com/${API_VERSION}/${mediaId}`,
-    { headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` } },
+    { headers: { Authorization: `Bearer ${accessToken}` } },
   );
   const downloadUrl = metaRes.data?.url;
   if (!downloadUrl) throw new Error("Meta did not return a download URL");
@@ -28,7 +47,7 @@ async function fetchAndStoreMedia({ messageId, mediaId, messageType }) {
 
   // 2. Download the bytes (WhatsApp media is <=16MB, safe to buffer).
   const fileRes = await axios.get(downloadUrl, {
-    headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` },
+    headers: { Authorization: `Bearer ${accessToken}` },
     responseType: "arraybuffer",
   });
   const buffer = Buffer.from(fileRes.data);
@@ -39,7 +58,7 @@ async function fetchAndStoreMedia({ messageId, mediaId, messageType }) {
   // 4. Persist the permanent URL and let the frontend swap the placeholder.
   await prisma.message.update({ where: { id: messageId }, data: { mediaUrl: result.url } });
   try {
-    getIO().emit("message.media_ready", { messageId, mediaUrl: result.url });
+    emitToNumber(numberId, "message.media_ready", { messageId, mediaUrl: result.url });
   } catch {
     // Socket not ready (e.g. called from a script) — non-fatal.
   }
