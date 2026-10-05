@@ -56,7 +56,14 @@ const resolveNamedVars = (text, customer, agent) => {
   });
 };
 
+// Every {{...}} in the text, supported or not — for validation.
+const ANY_PLACEHOLDER_RE = /\{\{\s*([^{}]*?)\s*\}\}/g;
+const listPlaceholders = (text) => [...String(text || "").matchAll(ANY_PLACEHOLDER_RE)].map((m) => m[1]);
+const SUPPORTED_VARS = Object.keys(RESOLVERS);
+
 module.exports = {
+  SUPPORTED_VARS,
+  listPlaceholders,
   extractOrderedVars,
   toMetaPositionalBody,
   buildTemplateParams,

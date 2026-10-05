@@ -1,6 +1,7 @@
 const express = require("express");
 const protect = require("../../middleware/auth");
-const requireRole = require("../../middleware/roles");
+const requirePermission = require("../../middleware/permissions");
+const { resolveNumber } = require("../../middleware/whatsappNumber");
 const {
   getTemplates,
   createTemplate,
@@ -13,14 +14,19 @@ const {
 
 const router = express.Router();
 
-router.get("/", protect, getTemplates);
-router.post("/sync", protect, requireRole("ADMIN"), syncApprovalStatus);
-router.post("/", protect, requireRole("ADMIN"), createTemplate);
-router.put("/:id", protect, requireRole("ADMIN"), updateTemplate);
-router.delete("/:id", protect, requireRole("ADMIN"), deleteTemplate);
-router.post("/:id/submit", protect, requireRole("ADMIN"), submitForApproval);
+// This file used to attach `protect` per route, making it the one router that
+// did not follow the router.use pattern. Collapsed so number resolution is
+// applied uniformly and cannot be forgotten on a route added later.
+router.use(protect, resolveNumber());
+
+router.get("/", requirePermission("template:read"), getTemplates);
+router.post("/sync", requirePermission("template:write"), syncApprovalStatus);
+router.post("/", requirePermission("template:write"), createTemplate);
+router.put("/:id", requirePermission("template:write"), updateTemplate);
+router.delete("/:id", requirePermission("template:write"), deleteTemplate);
+router.post("/:id/submit", requirePermission("template:write"), submitForApproval);
 
 // Send a template in a conversation — :id is conversationId
-router.post("/conversations/:id/send-template", protect, sendTemplate);
+router.post("/conversations/:id/send-template", requirePermission("message:send"), sendTemplate);
 
 module.exports = router;
