@@ -1,5 +1,6 @@
 const prisma = require("../../config/prisma");
 const AppError = require("../../utils/AppError");
+const { emitToNumber } = require("../../utils/socket");
 const { buildCustomerWhere, validateDefinition } = require("../../utils/segmentFilter");
 const {
   normalizeImportPhone,
@@ -254,6 +255,15 @@ const updateCustomer = async (req, res, next) => {
       data,
     });
     res.status(200).json({ success: true, data: customer });
+
+    // Their chats show the name in the inbox list and chat header: refresh
+    // those live (e.g. after an edit in the chat's contact panel).
+    prisma.conversation
+      .findMany({ where: { customerId: id }, select: { id: true, whatsappNumberId: true } })
+      .then((convs) => {
+        for (const c of convs) emitToNumber(c.whatsappNumberId, "conversation.updated", { conversationId: c.id });
+      })
+      .catch(() => {});
   } catch (err) {
     if (err.code === "P2025") return next(new AppError("Customer not found", 404));
     if (err.code === "P2002") {

@@ -3,6 +3,9 @@ const AppError = require("../../utils/AppError");
 const { emitToNumber } = require("../../utils/socket");
 const logAudit = require("../../utils/audit");
 const { ASSIGNEE_SELECT, isAssignable } = require("../../utils/conversationAssignment");
+const numbers = require("../../utils/whatsappNumbers");
+const { windowState } = require("../../utils/messagingWindow");
+const { sendTypingIndicator } = require("../../utils/whatsappClient");
 
 const VALID_STATUSES = ["OPEN", "PENDING", "RESOLVED"];
 
@@ -137,6 +140,177 @@ const getConversationMessages = async (req, res, next) => {
       success: true,
       data: messages,
       pagination: { total, page, limit, totalPages: Math.ceil(total / limit) },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─── POST /api/conversations/:id/typing ─────────────────────────────────────
+// An agent is typing a reply: show "typing…" to the customer on their latest
+// message. This also blue-ticks it — WhatsApp offers no typing without read —
+// which is why it's only sent while someone is actually writing back, never on
+// merely opening the chat. At most once per 20s per chat (it lasts 25s), and
+// only inside the 24-hour window, where a reply is possible at all.
+const TYPING_REFRESH_MS = 20_000;
+const lastTyping = new Map();
+const sendConversationTyping = async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id);
+    const conversation = await prisma.conversation.findUnique({
+      where: { id },
+      select: { whatsappNumberId: true, lastCustomerMessageAt: true },
+    });
+    if (!conversation || conversation.whatsappNumberId !== req.numberId) {
+      return next(new AppError("Conversation not found", 404));
+    }
+    const now = Date.now();
+    if (now - (lastTyping.get(id) || 0) < TYPING_REFRESH_MS) return res.status(200).json({ success: true, sent: false });
+    if (!windowState(conversation.lastCustomerMessageAt).open) return res.status(200).json({ success: true, sent: false });
+
+    const latest = await prisma.message.findFirst({
+      where: { conversationId: id, senderType: "CUSTOMER", whatsappMessageId: { not: null } },
+      orderBy: { createdAt: "desc" },
+      select: { whatsappMessageId: true },
+    });
+    if (!latest) return res.status(200).json({ success: true, sent: false });
+
+    lastTyping.set(id, now);
+    try {
+      const credentials = await numbers.getCredentials(conversation.whatsappNumberId);
+      await sendTypingIndicator({ number: credentials, messageId: latest.whatsappMessageId });
+    } catch (err) {
+      // Cosmetic: never surface as an error to the agent who's typing.
+      console.warn("Typing indicator failed:", err.response?.data?.error?.message || err.message);
+      return res.status(200).json({ success: true, sent: false });
+    }
+    res.status(200).json({ success: true, sent: true });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─── GET /api/conversations/:id/profile ─────────────────────────────────────
+// Everything the chat's contact panel shows, in one request: the customer,
+// what flows collected from them (booking requests), the chat's media, docs and
+// links, and the campaigns they received.
+const URL_RE = /https?:\/\/[^\s<>"')\]]+/gi;
+const getConversationProfile = async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id);
+    const conversation = await prisma.conversation.findUnique({
+      where: { id },
+      select: {
+        id: true, whatsappNumberId: true, status: true, createdAt: true, lastCustomerMessageAt: true,
+        assignedAgent: { select: ASSIGNEE_SELECT },
+        customer: true,
+      },
+    });
+    if (!conversation || conversation.whatsappNumberId !== req.numberId) {
+      return next(new AppError("Conversation not found", 404));
+    }
+    const customerId = conversation.customer.id;
+    const notDeleted = { conversationId: id, deletedAt: null };
+
+    const [runs, mediaRows, mediaCounts, linkRows, campaigns, optOut, messageCount] = await Promise.all([
+      prisma.flowRun.findMany({
+        where: { conversationId: id },
+        orderBy: { startedAt: "desc" },
+        take: 20,
+        select: { id: true, status: true, startedAt: true, completedAt: true, data: true, flow: { select: { id: true, name: true } } },
+      }),
+      prisma.message.findMany({
+        where: { ...notDeleted, messageType: { in: ["IMAGE", "VIDEO", "DOCUMENT", "AUDIO"] } },
+        orderBy: { createdAt: "desc" },
+        take: 60,
+        select: { id: true, messageType: true, mediaUrl: true, content: true, senderType: true, createdAt: true },
+      }),
+      prisma.message.groupBy({
+        by: ["messageType"],
+        where: { ...notDeleted, messageType: { in: ["IMAGE", "VIDEO", "DOCUMENT", "AUDIO"] } },
+        _count: { _all: true },
+      }),
+      prisma.message.findMany({
+        where: { ...notDeleted, content: { contains: "http" } },
+        orderBy: { createdAt: "desc" },
+        take: 80,
+        select: { id: true, content: true, senderType: true, createdAt: true },
+      }),
+      prisma.campaignRecipient.findMany({
+        where: { customerId, status: "SENT", campaign: { whatsappNumberId: conversation.whatsappNumberId } },
+        orderBy: { sentAt: "desc" },
+        take: 10,
+        select: { sentAt: true, repliedAt: true, campaign: { select: { id: true, name: true } } },
+      }),
+      prisma.customerOptOut.findFirst({
+        where: { customerId, whatsappNumberId: conversation.whatsappNumberId },
+        select: { optedOutAt: true, source: true },
+      }),
+      prisma.message.count({ where: notDeleted }),
+    ]);
+
+    // Links: every URL a person would see in the chat, newest first, once each.
+    // Template/flow messages store JSON; only their visible text and link
+    // buttons count — not the image addresses in their headers and cards.
+    const visibleText = (content) => {
+      try {
+        const p = JSON.parse(content);
+        if (p && typeof p === "object") {
+          const parts = [p.body, p.footer, p.header];
+          for (const b of p.buttons || []) if (b && b.url) parts.push(b.url);
+          for (const c of p.cards || []) {
+            parts.push(c.body);
+            for (const b of c.buttons || []) if (b && b.url) parts.push(b.url);
+          }
+          return parts.filter(Boolean).join("\n");
+        }
+      } catch {
+        // plain text
+      }
+      return String(content || "");
+    };
+    const seen = new Set();
+    const links = [];
+    for (const m of linkRows) {
+      for (const url of visibleText(m.content).match(URL_RE) || []) {
+        const clean = url.replace(/[.,;:!?]+$/, "");
+        if (seen.has(clean)) continue;
+        seen.add(clean);
+        links.push({ messageId: m.id, url: clean, senderType: m.senderType, createdAt: m.createdAt });
+      }
+    }
+
+    // What each flow visit collected; the ones with booking details first.
+    const responses = runs
+      .map((r) => ({
+        id: r.id,
+        flow: r.flow,
+        status: r.status,
+        startedAt: r.startedAt,
+        completedAt: r.completedAt,
+        answers: (r.data && r.data.answers) || {},
+      }))
+      .filter((r) => Object.keys(r.answers).length > 0);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        customer: conversation.customer,
+        conversation: {
+          id: conversation.id,
+          status: conversation.status,
+          createdAt: conversation.createdAt,
+          lastCustomerMessageAt: conversation.lastCustomerMessageAt,
+          assignedAgent: conversation.assignedAgent,
+          messageCount,
+        },
+        optOut,
+        responses,
+        media: mediaRows,
+        mediaCounts: Object.fromEntries(mediaCounts.map((g) => [g.messageType, g._count._all])),
+        links: links.slice(0, 50),
+        campaigns: campaigns.map((c) => ({ id: c.campaign.id, name: c.campaign.name, sentAt: c.sentAt, repliedAt: c.repliedAt })),
+      },
     });
   } catch (err) {
     next(err);
@@ -368,6 +542,8 @@ module.exports = {
   getConversationCounts,
   getConversationMessages,
   markConversationRead,
+  sendConversationTyping,
+  getConversationProfile,
   assignConversation,
   changeConversationStatus,
   createOrGetConversation,

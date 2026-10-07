@@ -29,6 +29,7 @@ const getOverview = async (req, res, next) => {
       newCustomers,
       agentsByStatus,
       unreadAgg,
+      unreadChats,
     ] = await Promise.all([
       prisma.message.count({ where: { createdAt: { gte: todayStart }, ...messageWhere(req) } }),
       prisma.message.count({ where: { createdAt: { gte: sevenDaysAgo }, ...messageWhere(req) } }),
@@ -45,6 +46,9 @@ const getOverview = async (req, res, next) => {
       prisma.customer.count({ where: { createdAt: { gte: sevenDaysAgo } } }),
       prisma.user.groupBy({ by: ["status"], where: { role: "AGENT" }, _count: { id: true } }),
       prisma.conversation.aggregate({ where: conversationWhere(req), _sum: { unreadCount: true } }),
+      // Chats with anything unread — what the Inbox badge shows, like WhatsApp
+      // (one chat with five new messages is one, not five).
+      prisma.conversation.count({ where: { ...conversationWhere(req), unreadCount: { gt: 0 } } }),
     ]);
 
     const conv = { OPEN: 0, PENDING: 0, RESOLVED: 0 };
@@ -70,6 +74,7 @@ const getOverview = async (req, res, next) => {
         customers: { total: totalCustomers, newLast7Days: newCustomers },
         agents: { online: agent.ONLINE, onBreak: agent.ON_BREAK, offline: agent.OFFLINE },
         unreadMessages: unreadAgg._sum.unreadCount || 0,
+        unreadConversations: unreadChats,
       },
     });
   } catch (err) {

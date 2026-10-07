@@ -7,6 +7,8 @@ const {
   getConversationCounts,
   getConversationMessages,
   markConversationRead,
+  sendConversationTyping,
+  getConversationProfile,
   assignConversation,
   changeConversationStatus,
   createOrGetConversation,
@@ -20,7 +22,9 @@ router.get("/", requirePermission("conversation:read"), getAllConversations);
 router.get("/counts", requirePermission("conversation:read"), getConversationCounts);
 router.post("/", requirePermission("conversation:write"), createOrGetConversation);
 router.get("/:id/messages", requirePermission("conversation:read"), getConversationMessages);
+router.get("/:id/profile", requirePermission("conversation:read"), getConversationProfile);
 router.post("/:id/read", requirePermission("conversation:write"), markConversationRead);
+router.post("/:id/typing", requirePermission("conversation:write"), sendConversationTyping);
 router.put("/:id/assign", requirePermission("conversation:assign"), assignConversation);
 router.put("/:id/status", requirePermission("conversation:write"), changeConversationStatus);
 
