@@ -20,8 +20,8 @@
 
 const prisma = require("../config/prisma");
 const numbers = require("./whatsappNumbers");
-const { sendWhatsAppMessage } = require("./whatsappClient");
-const { emitToNumber } = require("./socket");
+const { sendWhatsAppMessage, sendTypingIndicator } = require("./whatsappClient");
+const { emitToNumber, emitToNumberStaff } = require("./socket");
 const { isAssignable } = require("./conversationAssignment");
 const logAudit = require("./audit");
 const { nextNodeId, nodeById } = require("./flowGraph");
@@ -53,6 +53,13 @@ function parseReplyId(id) {
 }
 
 const emptyData = () => ({ answers: {}, path: [] });
+
+// A card's name for the responses: its first line without WhatsApp
+// formatting ("*Ulthera Skin Tightening*" → "Ulthera Skin Tightening").
+function cardLabel(card) {
+  const first = String(card.body || "").split("\n")[0].replace(/[*_~`]/g, "").trim();
+  return first || card.id;
+}
 const dataOf = (run) => ({ ...emptyData(), ...(run.data || {}) });
 
 // {{first_name}}, {{customer_name}}, {{phone}} and any collected answer.
@@ -67,7 +74,13 @@ function interpolate(text, customer, answers) {
   };
   return text.replace(/\{\{\s*([a-z_][a-z0-9_]*)\s*\}\}/gi, (full, key) => {
     const v = vars[key.toLowerCase()];
-    return v === undefined || v === null ? full : String(v);
+    if (v === undefined || v === null) return full;
+    // A collected date is stored as 2026-10-15 (sortable, exportable) but
+    // reads as "15 Oct 2026" in a message.
+    if (/^\d{4}-\d{2}-\d{2}$/.test(String(v))) {
+      return new Date(`${v}T00:00:00Z`).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+    }
+    return String(v);
   });
 }
 
@@ -115,9 +128,26 @@ const DEFAULT_RETRY = {
  * other outbound message (senderType BOT). Returns the saved message, or throws
  * after recording the failure.
  */
-async function sendBot(ctx, { kind, text, mediaType, mediaUrl, footer, header, buttons, list, prebuilt }) {
+// How long "typing…" shows before the flow's first reply to a tap/answer —
+// long enough to be seen, short enough not to feel slow.
+// (FLOW_TYPING_PAUSE_MS overrides it, e.g. 0 in tests.)
+const TYPING_PAUSE_MS = Number(process.env.FLOW_TYPING_PAUSE_MS ?? 1200);
+
+async function sendBot(ctx, { kind, text, mediaType, mediaUrl, footer, header, buttons, list, prebuilt, carousel }) {
   const { conversation, customer, numberId } = ctx;
   const credentials = await numbers.getCredentials(numberId);
+
+  // Once per customer message, and only now that a reply is certain: show
+  // "typing…" on it, then pause briefly. Never allowed to block the reply.
+  if (ctx.typingFor && !ctx.typed) {
+    ctx.typed = true;
+    try {
+      await sendTypingIndicator({ number: credentials, messageId: ctx.typingFor });
+      await new Promise((r) => setTimeout(r, TYPING_PAUSE_MS));
+    } catch (err) {
+      console.warn("[flow] typing indicator failed (reply still sent):", err.response?.data?.error?.message || err.message);
+    }
+  }
 
   let messageType;
   let content;
@@ -125,6 +155,17 @@ async function sendBot(ctx, { kind, text, mediaType, mediaUrl, footer, header, b
   if (prebuilt) {
     // An approved template (a carousel), built by buildTemplateSend.
     ({ messageType, content, sendArgs } = prebuilt);
+  } else if (kind === "cards") {
+    messageType = "INTERACTIVE";
+    // Same shape as a carousel template's cards, so the inbox renders both.
+    content = JSON.stringify({
+      body: text,
+      cards: carousel.map((c) => ({
+        mediaType: c.mediaType, mediaUrl: c.mediaUrl, body: c.body || "",
+        buttons: c.buttons.map((b) => ({ id: b.id, type: b.type, title: b.title, url: b.url })),
+      })),
+    });
+    sendArgs = { content: text, messageType, carousel };
   } else if (kind === "list") {
     messageType = "INTERACTIVE";
     content = JSON.stringify({
@@ -181,7 +222,7 @@ async function sendBot(ctx, { kind, text, mediaType, mediaUrl, footer, header, b
     });
   }
 
-  const preview = prebuilt ? prebuilt.preview : kind === "list" || (buttons && buttons.length) ? text : content;
+  const preview = prebuilt ? prebuilt.preview : kind === "list" || kind === "cards" || (buttons && buttons.length) ? text : content;
   await prisma.conversation.update({
     where: { id: conversation.id },
     data: { lastMessage: preview, lastMessageAt: new Date(), lastSenderType: "BOT" },
@@ -272,6 +313,22 @@ async function walk(ctx, run, graph, startNodeId) {
         nodeId = nextNodeId(graph, node.id, "next");
         break;
       }
+      case "cards": {
+        const carousel = (d.cards || []).map((c) => ({
+          mediaType: c.mediaType,
+          mediaUrl: c.mediaUrl,
+          body: c.body ? say(c.body) : undefined,
+          buttons: c.buttons.map((b) =>
+            b.type === "URL" ? { type: "URL", title: b.title, url: b.url } : { type: "QUICK_REPLY", id: replyId(run.id, node.id, `${c.id}.${b.id}`), title: b.title },
+          ),
+        }));
+        await sendBot(ctx, { kind: "cards", text: say(d.text), carousel });
+        if ((d.cards || []).some((c) => c.buttons.some((b) => b.type !== "URL"))) {
+          return prisma.flowRun.update({ where: { id: run.id }, data: { currentNodeId: node.id, data } });
+        }
+        nodeId = nextNodeId(graph, node.id, "next");
+        break;
+      }
       case "question": {
         await sendBot(ctx, { kind: "message", text: say(d.text) });
         return prisma.flowRun.update({ where: { id: run.id }, data: { currentNodeId: node.id, data } });
@@ -305,6 +362,19 @@ async function walk(ctx, run, graph, startNodeId) {
           });
         }
         emitToNumber(ctx.numberId, "conversation.updated", { conversationId: ctx.conversation.id });
+        // Tell the team, wherever they are in the CRM, that a customer is
+        // waiting for a person — with what they were looking at.
+        const flowRow = await prisma.flow.findUnique({ where: { id: run.flowId }, select: { name: true } });
+        emitToNumberStaff(ctx.numberId, "flow.handoff", {
+          conversationId: ctx.conversation.id,
+          customerName: ctx.customer.name || null,
+          customerPhone: ctx.customer.phone,
+          flowName: flowRow?.name || "Flow",
+          interest: data.answers.offer || data.answers.category || null,
+          agentId: agent?.id ?? null,
+          agentUsername: agent?.username ?? null,
+          at: new Date().toISOString(),
+        });
         logAudit({
           action: "flow.handed_off",
           actor: null,
@@ -360,6 +430,104 @@ async function expireStaleRuns(where = {}) {
   });
 }
 
+// What a tap on (node, optionId) means: the choice's title, the output it
+// leaves by, and what a "save as" variable stores. null = no such option any
+// more (removed since the message went out).
+function resolveTap(node, optionId) {
+  const d = node.data || {};
+  if (node.type === "cards") {
+    // optionId is "<cardId>.<buttonId>"
+    const dot = optionId.lastIndexOf(".");
+    const card = (d.cards || []).find((c) => c.id === optionId.slice(0, dot));
+    const button = card && card.buttons.find((b) => b.id === optionId.slice(dot + 1));
+    if (!button) return null;
+    const label = cardLabel(card);
+    return { title: `${label} · ${button.title}`, handle: `card:${card.id}:${button.id}`, saveAs: label };
+  }
+  if (node.type === "carousel") {
+    // optionId is "<cardIndex>.<buttonId>"
+    const [cardIdx, buttonId] = optionId.split(".");
+    const card = (d.cards || [])[Number(cardIdx)];
+    const button = card && (card.buttons || []).find((b) => b.id === buttonId);
+    if (!button) return null;
+    const title = `${card.label} · ${button.title}`;
+    return { title, handle: `card:${Number(cardIdx)}:${button.id}`, saveAs: title };
+  }
+  const isList = node.type === "list";
+  const option = (isList ? d.rows : d.buttons || []).find((o) => o.id === optionId);
+  if (!option) return null;
+  return { title: option.title, handle: `${isList ? "row" : "btn"}:${option.id}`, saveAs: option.title };
+}
+
+async function hasOptedOut(ctx) {
+  if (ctx.customer.optedOut) return true;
+  const row = await prisma.customerOptOut.findFirst({
+    where: { customerId: ctx.customer.id, whatsappNumberId: ctx.numberId },
+    select: { id: true },
+  });
+  return Boolean(row);
+}
+
+/**
+ * A forgiving flow: a tap on any button the flow ever sent in this chat works,
+ * like an old link on a website.
+ *   - From the run in progress, wherever it is now: jump to that branch. A
+ *     question waiting for a typed answer is dropped — the customer changed
+ *     their mind.
+ *   - From a finished run (completed, expired, replaced): start a fresh run
+ *     from that point, keeping the answers already given (e.g. which offer).
+ *   - Never after a hand-off: once a person has the chat, the bot stays out
+ *     (a new tap on the campaign message can still start over).
+ *   - Never after STOP.
+ */
+async function resumeFromTap(ctx, tapped, active) {
+  const source =
+    active && active.id === tapped.runId
+      ? active
+      : await prisma.flowRun.findUnique({ where: { id: tapped.runId }, include: { flow: true } });
+  if (!source || source.conversationId !== ctx.conversation.id) return; // not this chat's flow
+
+  const latest = await prisma.flowRun.findFirst({
+    where: { conversationId: ctx.conversation.id },
+    orderBy: { startedAt: "desc" },
+    select: { status: true },
+  });
+  if (latest?.status === "HANDED_OFF") return; // an agent has it
+  if (await hasOptedOut(ctx)) return;
+
+  const flow = source.flow;
+  if (!flow || !flow.isActive) return;
+  const graph = flow.graph;
+  const node = nodeById(graph, tapped.nodeId);
+  const choice = node && resolveTap(node, tapped.optionId);
+  if (!choice) return; // that step or button was removed since — leave it to the agents
+
+  let run = source;
+  if (source.status !== "ACTIVE") {
+    await endActiveRuns(ctx.conversation.id, "STOPPED"); // the new tap replaces whatever was running
+    run = await prisma.flowRun.create({
+      data: {
+        flowId: flow.id,
+        conversationId: ctx.conversation.id,
+        customerId: ctx.customer.id,
+        campaignId: source.campaignId,
+        data: { answers: { ...dataOf(source).answers }, path: [] },
+      },
+    });
+  }
+
+  const data = dataOf(run);
+  if (node.data.variable) data.answers[node.data.variable] = choice.saveAs;
+  data.path.push({
+    node: node.id,
+    choice: choice.title,
+    ...(run.id !== source.id || node.id !== source.currentNodeId ? { from: "earlier message" } : {}),
+    at: new Date().toISOString(),
+  });
+  run = await prisma.flowRun.update({ where: { id: run.id }, data: { data } });
+  return safeWalk(ctx, run, graph, nextNodeId(graph, node.id, choice.handle));
+}
+
 /**
  * Called by the webhook for every saved inbound customer message.
  *
@@ -369,7 +537,8 @@ async function expireStaleRuns(where = {}) {
  */
 function handleInbound({ numberId, customer, conversation, inbound, campaignReply, optIntent }) {
   return serialize(conversation.id, async () => {
-    const ctx = { numberId, customer, conversation };
+    // typingFor: the customer's message the first reply will show "typing…" on.
+    const ctx = { numberId, customer, conversation, typingFor: inbound.whatsappMessageId || null };
 
     if (optIntent === "OUT") {
       await endActiveRuns(conversation.id, "STOPPED");
@@ -383,36 +552,10 @@ function handleInbound({ numberId, customer, conversation, inbound, campaignRepl
       orderBy: { startedAt: "desc" },
     });
 
-    // 1. A tap on one of OUR interactive messages: resume exactly that run/step.
+    // 1. A tap on one of OUR buttons — on ANY message the flow sent, not only
+    // the latest: people scroll up and tap an old menu or card. See resumeFromTap.
     const tapped = parseReplyId(inbound.replyId);
-    if (tapped && active && tapped.runId === active.id && tapped.nodeId === active.currentNodeId) {
-      const graph = active.flow.graph;
-      const node = nodeById(graph, tapped.nodeId);
-      if (!node) return finish(active, "FAILED", { lastError: "The step this answer belongs to was deleted" });
-      let option;
-      let handle;
-      if (node.type === "carousel") {
-        // optionId is "<cardIndex>.<buttonId>"
-        const [cardIdx, buttonId] = tapped.optionId.split(".");
-        const card = (node.data.cards || [])[Number(cardIdx)];
-        const button = card && (card.buttons || []).find((b) => b.id === buttonId);
-        if (button) {
-          option = { title: `${card.label} · ${button.title}` };
-          handle = `card:${Number(cardIdx)}:${button.id}`;
-        }
-      } else {
-        const isList = node.type === "list";
-        option = (isList ? node.data.rows : node.data.buttons || []).find((o) => o.id === tapped.optionId);
-        if (option) handle = `${isList ? "row" : "btn"}:${option.id}`;
-      }
-      if (!option) return; // a button removed since the message went out — leave it to the agents
-      const data = dataOf(active);
-      if (node.data.variable) data.answers[node.data.variable] = option.title;
-      data.path.push({ node: node.id, choice: option.title, at: new Date().toISOString() });
-      const run = await prisma.flowRun.update({ where: { id: active.id }, data: { data } });
-      return safeWalk(ctx, run, graph, nextNodeId(graph, node.id, handle));
-    }
-    if (tapped) return; // a stale button from an older or finished run
+    if (tapped) return resumeFromTap(ctx, tapped, active);
 
     // 2. A fresh answer to a campaign that has a flow: (re)start. While a run is
     // in progress only a new template-button tap restarts it — a typed message

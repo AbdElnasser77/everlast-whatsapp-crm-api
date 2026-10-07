@@ -81,6 +81,7 @@ const extractFromPayload = (body) => {
     msg.text?.body ||
     msg.interactive?.button_reply?.title ||
     msg.interactive?.list_reply?.title ||
+    (msg.interactive?.type ? msg.interactive[msg.interactive.type]?.title : null) ||
     msg.button?.text ||
     msg.image?.caption ||
     msg.video?.caption ||
@@ -118,6 +119,9 @@ const extractFromPayload = (body) => {
     replyId:
       msg.interactive?.button_reply?.id ||
       msg.interactive?.list_reply?.id ||
+      // Any other interactive reply (e.g. a carousel card's quick reply) that
+      // carries an id, whatever Meta names the sub-object.
+      (msg.interactive?.type ? msg.interactive[msg.interactive.type]?.id : null) ||
       // A carousel card's quick reply sent by a flow carries the flow's id as
       // its payload — same shape as our interactive ids.
       (msg.button?.payload?.startsWith("f:") ? msg.button.payload : null),
@@ -561,7 +565,7 @@ const processChangePayload = async (body) => {
       numberId: number.id,
       customer,
       conversation,
-      inbound: { rawType, content, replyId, buttonPayload },
+      inbound: { rawType, content, replyId, buttonPayload, whatsappMessageId },
       campaignReply,
       optIntent,
     });

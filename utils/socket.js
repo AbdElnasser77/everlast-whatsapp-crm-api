@@ -140,6 +140,27 @@ const emitGlobal = (event, payload) => {
   io.emit(event, payload);
 };
 
+// Alert every connected user who could pick up a chat on this number —
+// whichever line they're currently viewing — and nobody else. For moments that
+// need a person (a flow handing a customer over), where emitToNumber would
+// miss an agent looking at another line, and emitGlobal would tell everyone.
+const emitToNumberStaff = async (numberId, event, payload) => {
+  if (!io) return;
+  try {
+    const { roleHasPermission } = require("../config/permissions");
+    const number = await numbers.getById(numberId);
+    if (!number) return;
+    for (const socket of io.sockets.sockets.values()) {
+      const user = socket.user;
+      if (user && roleHasPermission(user.role, "conversation:write") && mayUseNumber(user, number)) {
+        socket.emit(event, { ...payload, whatsappNumberId: numberId });
+      }
+    }
+  } catch (err) {
+    console.error(`Socket: "${event}" staff alert failed:`, err.message);
+  }
+};
+
 // Drop every live socket belonging to one user. Called after deactivate,
 // delete, and role change so the socket layer can't outlive the HTTP layer's
 // authoritative check.
@@ -151,4 +172,4 @@ const disconnectUser = (userId) => {
   io.in(`user:${userId}`).disconnectSockets(true);
 };
 
-module.exports = { initSocket, getIO, disconnectUser, emitToNumber, emitGlobal };
+module.exports = { initSocket, getIO, disconnectUser, emitToNumber, emitGlobal, emitToNumberStaff };

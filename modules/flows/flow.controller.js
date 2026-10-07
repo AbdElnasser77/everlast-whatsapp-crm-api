@@ -111,8 +111,22 @@ const updateFlow = async (req, res, next) => {
   try {
     const id = parseId(req.params.id);
     if (!id) return next(new AppError("Invalid flow id", 400));
-    const existing = await prisma.flow.findUnique({ where: { id }, select: { id: true } });
+    const existing = await prisma.flow.findUnique({ where: { id }, select: { id: true, updatedAt: true } });
     if (!existing) return next(new AppError("Flow not found", 404));
+
+    // A builder tab opened before someone else saved must not silently put
+    // its older copy back: the editor sends the version it loaded, and a save
+    // based on an outdated version is refused.
+    if (req.body.graph !== undefined && req.body.baseUpdatedAt) {
+      const base = new Date(req.body.baseUpdatedAt);
+      if (!Number.isNaN(base.getTime()) && existing.updatedAt.getTime() > base.getTime()) {
+        return next(new AppError(
+          "This flow was changed somewhere else after you opened it. Reload the page to get the latest version before saving.",
+          409,
+          "FLOW_CHANGED",
+        ));
+      }
+    }
 
     const data = {};
     if (req.body.name !== undefined) {

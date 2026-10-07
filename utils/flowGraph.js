@@ -9,6 +9,9 @@
 //   list      row:<rowId> per row
 //   carousel  card:<cardIndex>:<buttonId> per card quick reply, or `next` when
 //             the cards only have link buttons
+//   cards     card:<cardId>:<buttonId> per card quick reply, or `next` for
+//             link-only cards. Cards is WhatsApp's interactive (non-template)
+//             carousel: free inside the 24-hour window, no Meta approval.
 //   question  next          (after a valid answer)
 //   tag       next
 //   assign    —             (hands the chat to a human; the run ends)
@@ -19,7 +22,7 @@
 // time, which in a flow means a customer left hanging mid-conversation — so they
 // are enforced here, at save, instead.
 
-const NODE_TYPES = ["trigger", "message", "list", "carousel", "question", "tag", "assign", "end"];
+const NODE_TYPES = ["trigger", "message", "list", "carousel", "cards", "question", "tag", "assign", "end"];
 const MEDIA_TYPES = ["NONE", "IMAGE", "VIDEO", "DOCUMENT"];
 const INPUT_TYPES = ["text", "number", "email", "phone", "date"];
 
@@ -35,7 +38,11 @@ const LIMITS = {
   header: 60,
   footer: 60,
   nodes: 100,
+  cards: 10,
+  cardBody: 160,
+  cardButtons: 2,
 };
+const CARD_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
 
 const VARIABLE_RE = /^[a-z_][a-z0-9_]{0,39}$/;
 
@@ -53,6 +60,12 @@ function handlesOf(node) {
       return (d.rows || []).map((r) => `row:${r.id}`);
     case "carousel": {
       const taps = (d.cards || []).flatMap((c, i) => (c.buttons || []).map((b) => `card:${i}:${b.id}`));
+      return taps.length ? taps : ["next"];
+    }
+    case "cards": {
+      const taps = (d.cards || []).flatMap((c) =>
+        (c.buttons || []).filter((b) => b.type !== "URL").map((b) => `card:${c.id}:${b.id}`),
+      );
       return taps.length ? taps : ["next"];
     }
     case "question":
@@ -78,7 +91,7 @@ function variablesOf(graph) {
   const out = [];
   for (const n of graph.nodes || []) {
     const v = str(n.data?.variable);
-    if (v && ["question", "message", "list", "carousel"].includes(n.type) && !out.includes(v)) out.push(v);
+    if (v && ["question", "message", "list", "carousel", "cards"].includes(n.type) && !out.includes(v)) out.push(v);
   }
   return out;
 }
@@ -189,6 +202,46 @@ function validateGraph(input) {
           label: str(c?.label) || "Card",
           buttons: (Array.isArray(c?.buttons) ? c.buttons : []).map((b) => ({ id: str(b?.id), title: str(b?.title) })).filter((b) => b.id),
         }));
+        data.variable = checkVariable();
+        break;
+      }
+      case "cards": {
+        data.text = checkText("text", LIMITS.body);
+        const rawCards = Array.isArray(d.cards) ? d.cards : [];
+        if (rawCards.length < 2 || rawCards.length > LIMITS.cards) fail(`Cards needs between 2 and ${LIMITS.cards} cards`, id);
+        const seenCards = new Set();
+        const shape = (c) => c.buttons.map((b) => b.type).join(",");
+        data.cards = rawCards.map((c, i) => {
+          const n = i + 1;
+          const cid = str(c?.id);
+          if (!CARD_ID_RE.test(cid) || seenCards.has(cid)) fail(`Card ${n} needs a unique id`, id);
+          seenCards.add(cid);
+          const mediaType = c?.mediaType === "VIDEO" ? "VIDEO" : "IMAGE";
+          const mediaUrl = str(c?.mediaUrl);
+          if (!/^https:\/\//i.test(mediaUrl)) fail(`Card ${n} needs its ${mediaType.toLowerCase()} (a public https:// link)`, id);
+          const body = str(c?.body);
+          if (body.length > LIMITS.cardBody) fail(`Card ${n}'s text is ${body.length} characters — WhatsApp allows ${LIMITS.cardBody}`, id);
+          if ((body.match(/\n/g) || []).length > 2) fail(`Card ${n}'s text can have at most 2 line breaks`, id);
+          const buttons = (Array.isArray(c?.buttons) ? c.buttons : []).map((b, j) => {
+            const type = b?.type === "URL" ? "URL" : "QUICK_REPLY";
+            const title = str(b?.title);
+            if (!title) fail(`Card ${n}: every button needs a title`, id);
+            if (title.length > LIMITS.buttonTitle) fail(`Card ${n}: "${title}" is longer than ${LIMITS.buttonTitle} characters`, id);
+            if (type === "URL") {
+              const url = str(b?.url);
+              if (!/^https?:\/\//i.test(url)) fail(`Card ${n}: "${title}" needs a link starting with https://`, id);
+              return { id: `b${j}`, type, title, url };
+            }
+            return { id: `b${j}`, type, title };
+          });
+          if (!buttons.length) fail(`Card ${n} needs a button`, id);
+          if (buttons.some((b) => b.type === "URL") && buttons.length > 1) fail(`Card ${n}: a link button must be the card's only button`, id);
+          if (buttons.length > LIMITS.cardButtons) fail(`Card ${n}: at most ${LIMITS.cardButtons} buttons`, id);
+          return { id: cid, mediaType, mediaUrl, body: body || undefined, buttons };
+        });
+        if (data.cards.length > 1 && data.cards.some((c) => shape(c) !== shape(data.cards[0]))) {
+          fail("Every card needs the same buttons (same number and type) — WhatsApp's rule for carousels", id);
+        }
         data.variable = checkVariable();
         break;
       }

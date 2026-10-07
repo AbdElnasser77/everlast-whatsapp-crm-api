@@ -41,6 +41,9 @@ const sendWhatsAppMessage = async ({
   list = null,
   // TEMPLATE carousel: [{ mediaType, mediaUrl, quickReplyPayloads: [payload|null] }]
   carouselCards = null,
+  // INTERACTIVE carousel (no template, 24h window only):
+  // [{ mediaType, mediaUrl, body?, buttons: [{ type: QUICK_REPLY, id, title } | { type: URL, title, url }] }]
+  carousel = null,
 }) => {
   // No environment fallback, deliberately. A fallback would mean a call site
   // that forgot to pass `number` keeps silently sending from whichever line the
@@ -82,13 +85,36 @@ const sendWhatsAppMessage = async ({
       // button, or a mix of CTA buttons, only renders as real tappable buttons
       // inside an approved Meta TEMPLATE — for an immediate/ad-hoc send we
       // degrade gracefully to plain text lines instead of dropping the info.
-      const list = buttons || [];
+      // Not named "list": that would hide the `list` parameter (a list message).
+      const btns = buttons || [];
       const interactiveHeader = buildInteractiveHeader(headerType, header, headerMediaUrl);
-      const allQuickReply = list.length > 0 && list.every((b) => (b.type || "QUICK_REPLY") === "QUICK_REPLY");
-      const singleUrlButton = list.length === 1 && list[0].type === "URL";
+      const allQuickReply = btns.length > 0 && btns.every((b) => (b.type || "QUICK_REPLY") === "QUICK_REPLY");
+      const singleUrlButton = btns.length === 1 && btns[0].type === "URL";
 
       payload.type = "interactive";
-      if (list) {
+      if (carousel) {
+        // Shape from Meta's "interactive media carousel" docs, whose examples
+        // give every card type "cta_url", quick-reply cards included.
+        payload.interactive = {
+          type: "carousel",
+          body: { text: content },
+          action: {
+            cards: carousel.map((c, i) => {
+              const key = c.mediaType === "VIDEO" ? "video" : "image";
+              const link = c.buttons.find((b) => b.type === "URL");
+              return {
+                card_index: i,
+                type: "cta_url",
+                header: { type: key, [key]: { link: c.mediaUrl } },
+                ...(c.body && { body: { text: c.body } }),
+                action: link
+                  ? { name: "cta_url", parameters: { display_text: link.title, url: link.url } }
+                  : { buttons: c.buttons.map((b) => ({ type: "quick_reply", quick_reply: { id: b.id, title: b.title } })) },
+              };
+            }),
+          },
+        };
+      } else if (list) {
         payload.interactive = {
           type: "list",
           ...(headerType === "TEXT" && header && { header: { type: "text", text: header } }),
@@ -107,7 +133,7 @@ const sendWhatsAppMessage = async ({
           ...(interactiveHeader && { header: interactiveHeader }),
           body: { text: content },
           ...(footer && { footer: { text: footer } }),
-          action: { buttons: list.slice(0, 3).map((b) => ({ type: "reply", reply: { id: b.id, title: b.title } })) },
+          action: { buttons: btns.slice(0, 3).map((b) => ({ type: "reply", reply: { id: b.id, title: b.title } })) },
         };
       } else if (singleUrlButton) {
         payload.interactive = {
@@ -115,10 +141,10 @@ const sendWhatsAppMessage = async ({
           ...(interactiveHeader && { header: interactiveHeader }),
           body: { text: content },
           ...(footer && { footer: { text: footer } }),
-          action: { name: "cta_url", parameters: { display_text: list[0].title, url: list[0].url } },
+          action: { name: "cta_url", parameters: { display_text: btns[0].title, url: btns[0].url } },
         };
-      } else if (list.length > 0) {
-        const lines = list.map((b) =>
+      } else if (btns.length > 0) {
+        const lines = btns.map((b) =>
           b.type === "PHONE_NUMBER" ? `📞 ${b.title}: ${b.phoneNumber}` : b.type === "URL" ? `🔗 ${b.title}: ${b.url}` : `• ${b.title}`
         );
         payload.type = "text";
@@ -190,4 +216,19 @@ const sendWhatsAppMessage = async ({
   return { whatsappMessageId };
 };
 
-module.exports = { sendWhatsAppMessage, getApiVersion };
+/**
+ * Show "typing…" to the customer on their message `messageId` (a wamid).
+ * WhatsApp ties this to a read receipt: the message turns blue-ticked now.
+ * It lasts up to 25 seconds or until our next message. Only call it when a
+ * reply is actually coming (WhatsApp's own guidance).
+ */
+const sendTypingIndicator = async ({ number, messageId }) => {
+  if (!number?.phoneNumberId || !number?.accessToken || !messageId) return;
+  await axios.post(
+    `https://graph.facebook.com/${getApiVersion()}/${number.phoneNumberId}/messages`,
+    { messaging_product: "whatsapp", status: "read", message_id: messageId, typing_indicator: { type: "text" } },
+    { headers: { Authorization: `Bearer ${number.accessToken}`, "Content-Type": "application/json" }, timeout: 10_000 },
+  );
+};
+
+module.exports = { sendWhatsAppMessage, sendTypingIndicator, getApiVersion };
