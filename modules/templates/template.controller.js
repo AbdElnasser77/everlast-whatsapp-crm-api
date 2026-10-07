@@ -377,6 +377,47 @@ const deleteTemplate = async (req, res, next) => {
     });
     if (!existing || !existing.isActive) return next(new AppError("Template not found", 404));
 
+    // Deleting at Meta stops every send of this template, so refuse while a
+    // campaign still needs it rather than failing that campaign mid-send.
+    const inUse = await prisma.campaign.count({
+      where: { templateId: id, status: { in: ["SCHEDULED", "RUNNING", "PAUSED"] } },
+    });
+    if (inUse > 0) {
+      return next(new AppError(
+        `${inUse} scheduled, running or paused campaign(s) still use this template — finish or cancel them first`,
+        409,
+      ));
+    }
+
+    // A template that was ever submitted also exists in WhatsApp Manager.
+    // Hiding it here alone left it there; delete it at Meta first, so the two
+    // never disagree. Meta keeps the name reserved for 30 days afterwards.
+    if (existing.metaTemplateName) {
+      try {
+        const credentials = await numbers.getCredentials(req.numberId);
+        await axios.delete(`https://graph.facebook.com/${getApiVersion()}/${existing.wabaId}/message_templates`, {
+          params: {
+            name: existing.metaTemplateName,
+            ...(existing.metaTemplateId ? { hsm_id: existing.metaTemplateId } : {}),
+          },
+          headers: { Authorization: `Bearer ${credentials.accessToken}` },
+          timeout: 20000,
+        });
+      } catch (metaErr) {
+        const metaError = metaErr.response?.data?.error;
+        // Already gone at Meta (deleted in WhatsApp Manager): just hide it here.
+        const alreadyGone = /does not exist|not found|nonexisting/i.test(metaError?.error_user_msg || metaError?.message || "");
+        if (!alreadyGone) {
+          console.error("Meta template delete failed:", JSON.stringify(metaErr.response?.data || metaErr.message));
+          return next(new AppError(
+            `WhatsApp didn't delete the template: ${metaError?.error_user_msg || metaError?.message || metaErr.message}`,
+            metaErr.response ? 422 : 502,
+            "META_DELETE_FAILED",
+          ));
+        }
+      }
+    }
+
     await prisma.template.update({ where: { id }, data: { isActive: false } });
 
     res.status(200).json({ success: true, message: "Template deleted" });
