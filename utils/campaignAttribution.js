@@ -7,9 +7,13 @@
 //      campaign. Precise, and linked whenever it happens.
 //   2. WINDOW — otherwise, the FIRST message from this customer, on this
 //      number, within ATTRIBUTION_WINDOW_DAYS of a campaign reaching them
-//      counts as a reply to the most recent such campaign. Most people just
-//      type a new message rather than swiping to reply, so rule 1 alone would
-//      miss the majority of real replies.
+//      counts as a reply to the most recent such campaign — and ONLY that one.
+//      If the latest campaign already has its reply, the message is ordinary
+//      conversation; it never falls back to an older campaign (which would
+//      credit two campaigns for one exchange and could start the older
+//      campaign's flow on a follow-up message). Most people just type a new
+//      message rather than swiping to reply, so rule 1 alone would miss the
+//      majority of real replies.
 // Only the first message of a reply is linked. Everything after it is the
 // ordinary conversation that follows, and `CampaignRecipient.repliedAt` —
 // what "Replied" counts — is set once and never moved.
@@ -56,14 +60,13 @@ async function attributeReply({ messageId, customerId, whatsappNumberId, quotedW
     where: {
       customerId,
       status: "SENT",
-      repliedAt: null,
       sentAt: { gte: since, lte: now },
       campaign: { whatsappNumberId },
     },
     orderBy: { sentAt: "desc" },
-    ...CAMPAIGN_SELECT,
+    select: { ...CAMPAIGN_SELECT.select, repliedAt: true },
   });
-  if (!recipient) return null;
+  if (!recipient || recipient.repliedAt) return null;
 
   // Claim the "first reply" atomically: if two messages arrive at once, only one
   // of them matches `repliedAt: null`, and only that one is linked.

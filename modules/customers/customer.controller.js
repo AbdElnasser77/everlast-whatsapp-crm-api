@@ -321,15 +321,38 @@ const importCustomers = async (req, res, next) => {
   }
 };
 
+// Campaigns that had these customers as recipients get their counters
+// recounted after the rows are gone, so "sent 40 of 41" doesn't stay wrong.
+async function campaignsOf(customerIds) {
+  const rows = await prisma.campaignRecipient.findMany({
+    where: { customerId: { in: customerIds } },
+    select: { campaignId: true, campaign: { select: { whatsappNumberId: true } } },
+    distinct: ["campaignId"],
+  });
+  return rows.map((r) => ({ id: r.campaignId, numberId: r.campaign.whatsappNumberId }));
+}
+async function recountAfterDelete(campaigns) {
+  // Required lazily: the campaign controller pulls in a lot, and this file is
+  // also used by scripts that don't need it.
+  const { recountCampaign } = require("../campaigns/campaign.controller");
+  for (const c of campaigns) {
+    await recountCampaign(c.id, c.numberId).catch((err) =>
+      console.error(`Recount of campaign ${c.id} after customer delete failed:`, err.message),
+    );
+  }
+}
+
 const deleteCustomer = async (req, res, next) => {
   try {
     const id = parseInt(req.params.id);
+    const affected = await campaignsOf([id]);
     await prisma.$transaction([
       prisma.message.deleteMany({ where: { conversation: { customerId: id } } }),
       prisma.conversation.deleteMany({ where: { customerId: id } }),
       prisma.campaignRecipient.deleteMany({ where: { customerId: id } }),
       prisma.customer.delete({ where: { id } }),
     ]);
+    await recountAfterDelete(affected);
     res.status(200).json({ success: true, message: "Customer deleted" });
   } catch (err) {
     if (err.code === "P2025") return next(new AppError("Customer not found", 404));
@@ -350,6 +373,7 @@ const bulkDeleteCustomers = async (req, res, next) => {
     if (parsed.length === 0) return next(new AppError("No valid customer ids provided", 400));
     if (parsed.length > 5000) return next(new AppError("Cannot delete more than 5000 customers per request", 400));
 
+    const affected = await campaignsOf(parsed);
     const results = await prisma.$transaction([
       prisma.message.deleteMany({ where: { conversation: { customerId: { in: parsed } } } }),
       prisma.conversation.deleteMany({ where: { customerId: { in: parsed } } }),
@@ -357,6 +381,7 @@ const bulkDeleteCustomers = async (req, res, next) => {
       prisma.customer.deleteMany({ where: { id: { in: parsed } } }),
     ]);
     const deleted = results[results.length - 1].count;
+    await recountAfterDelete(affected);
     res.status(200).json({ success: true, message: `Deleted ${deleted} customer(s)`, data: { deleted } });
   } catch (err) {
     next(err);

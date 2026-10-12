@@ -13,6 +13,7 @@ const {
   changeConversationStatus,
   createOrGetConversation,
 } = require("./conversation.controller");
+const { setOutcome, cancelBooking, listNotes, addNote, deleteNote } = require("./outcome.controller");
 
 const router = express.Router();
 
@@ -27,5 +28,12 @@ router.post("/:id/read", requirePermission("conversation:write"), markConversati
 router.post("/:id/typing", requirePermission("conversation:write"), sendConversationTyping);
 router.put("/:id/assign", requirePermission("conversation:assign"), assignConversation);
 router.put("/:id/status", requirePermission("conversation:write"), changeConversationStatus);
+// How the chat ended up (Booked with the appointment, Not interested, Follow up, No answer).
+router.put("/:id/outcome", requirePermission("conversation:write"), setOutcome);
+router.post("/:id/bookings/:bookingId/cancel", requirePermission("conversation:write"), cancelBooking);
+// Staff-only notes on the chat.
+router.get("/:id/notes", requirePermission("conversation:read"), listNotes);
+router.post("/:id/notes", requirePermission("conversation:write"), addNote);
+router.delete("/:id/notes/:noteId", requirePermission("conversation:write"), deleteNote);
 
 module.exports = router;

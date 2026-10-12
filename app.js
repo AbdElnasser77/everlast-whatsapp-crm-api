@@ -73,6 +73,8 @@ app.use("/api/stats", require("./modules/stats/stats.routes"));
 app.use("/api/templates", require("./modules/templates/template.routes"));
 app.use("/api/campaigns", require("./modules/campaigns/campaign.routes"));
 app.use("/api/whatsapp", require("./modules/whatsapp-status/whatsappStatus.routes"));
+app.use("/api/settings", require("./modules/settings/settings.routes"));
+app.use("/api/supervision", require("./modules/supervision/supervision.routes"));
 // Dev-only tools (message/cost tracker). Never mounted in production.
 if (process.env.NODE_ENV !== "production") {
   app.use("/api/dev", require("./modules/dev/dev.routes"));

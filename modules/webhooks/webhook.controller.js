@@ -7,6 +7,7 @@ const numbers = require("../../utils/whatsappNumbers");
 const logAudit = require("../../utils/audit");
 const { attributeReply } = require("../../utils/campaignAttribution");
 const flowEngine = require("../../utils/flowEngine");
+const { patientWroteData } = require("../../utils/followUp");
 
 // An unrecognized phone_number_id is almost always a misrouted subscription, and
 // Meta will keep sending. Log and audit it once per number per hour so a
@@ -112,6 +113,8 @@ const extractFromPayload = (body) => {
     rawType,
     isRecognized: Boolean(mappedType),
     whatsappMessageId: msg.id,
+    // When the customer actually sent it (Meta's clock), not when we got it.
+    sentAt: msg.timestamp ? new Date(Number(msg.timestamp) * 1000) : null,
     quotedWhatsappMessageId,
     // What a tap actually selected, for flows (utils/flowEngine.js): the id of
     // the button/list row on our own interactive messages, or a template
@@ -216,6 +219,29 @@ const handleStatusUpdate = async (value) => {
   }
 };
 
+// A status can arrive before the sender has saved Meta's message id: Meta
+// answers the send request and fires the "sent" (or a fast "failed") webhook
+// at almost the same moment. For a fresh status, look again a couple of times
+// before giving up; an old one (a replayed delivery) is not waited for.
+const STATUS_LOOKUP_RETRY_MS = (process.env.WEBHOOK_STATUS_RETRY_MS || "3000,10000").split(",").map(Number);
+async function findMessageForStatus(whatsappMessageId, timestamp) {
+  const find = () =>
+    prisma.message.findUnique({
+      where: { whatsappMessageId },
+      include: { conversation: { select: { whatsappNumberId: true, customerId: true } } },
+    });
+  let message = await find();
+  const ageMs = timestamp ? Date.now() - Number(timestamp) * 1000 : 0;
+  if (message || ageMs > 2 * 60 * 1000) return message;
+  for (const wait of STATUS_LOOKUP_RETRY_MS) {
+    await new Promise((r) => setTimeout(r, wait));
+    message = await find();
+    if (message) return message;
+  }
+  console.log(`Webhook: status for unknown message ${whatsappMessageId} — not ours, or never saved`);
+  return null;
+}
+
 const handleOneStatus = async (statusEntry) => {
   const { id: whatsappMessageId, status } = statusEntry;
   const mapped = STATUS_MAP[status];
@@ -223,10 +249,7 @@ const handleOneStatus = async (statusEntry) => {
 
   // whatsappMessageId is globally unique across Meta, so this lookup stays
   // correct without a number filter — but the emit still has to be scoped.
-  const message = await prisma.message.findFirst({
-    where: { whatsappMessageId },
-    include: { conversation: { select: { whatsappNumberId: true, customerId: true } } },
-  });
+  const message = await findMessageForStatus(whatsappMessageId, statusEntry.timestamp);
   if (!message) return;
 
   // 131050: the customer stopped marketing messages in WhatsApp itself. Record
@@ -333,7 +356,11 @@ const handleReaction = async (value) => {
 };
 
 // WhatsApp opt-out compliance: honor STOP/START style keywords from customers.
-const OPT_OUT_KEYWORDS = new Set(["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "QUIT", "END"]);
+// Deliberately not CANCEL / END / QUIT: at a clinic "Cancel" almost always
+// means an appointment, and treating it as an opt-out silently stopped every
+// future campaign to that patient. WhatsApp's own "Stop promotions" button is
+// handled separately (user_preferences / error 131050).
+const OPT_OUT_KEYWORDS = new Set(["STOP", "STOPALL", "UNSUBSCRIBE"]);
 const OPT_IN_KEYWORDS = new Set(["START", "UNSTOP", "SUBSCRIBE", "RESUME"]);
 const detectOptIntent = (content) => {
   const word = (content || "").trim().toUpperCase();
@@ -342,18 +369,50 @@ const detectOptIntent = (content) => {
   return null;
 };
 
+// Save first, then answer, then handle. Meta never re-sends a delivery it got
+// a 200 for, so answering before the delivery is stored anywhere meant a crash
+// in that moment lost the customer's message for good. If the save itself
+// fails, Meta gets a 500 and re-sends later — the one case where its retry is
+// exactly what we want. Handling stays after the 200: Meta wants a fast answer.
 const receiveWhatsAppMessage = async (req, res) => {
-  // Return 200 immediately — Meta requires a fast response or it will retry
+  let event;
+  try {
+    event = await prisma.webhookEvent.create({ data: { payload: req.body || {} } });
+  } catch (err) {
+    console.error("Webhook: could not save delivery — answering 500 so Meta re-sends it:", err.message);
+    return res.sendStatus(500);
+  }
   res.sendStatus(200);
+  await processWebhookEvent(event);
+};
 
+// Handle one saved delivery and record the outcome. Safe to run again on the
+// same event: inbound messages are de-duplicated by WhatsApp id and statuses
+// only move forward. Used by receive above and by jobs/webhookRecovery.js.
+const processWebhookEvent = async (event) => {
+  const body = event.payload || {};
+  const errors = [];
   // Meta can batch several entries/changes into one delivery. Each is handled
   // on its own, in order, as a single-change payload — the shape the rest of
-  // this file expects.
-  for (const entry of req.body?.entry || []) {
+  // this file expects. One failing change doesn't stop the others.
+  for (const entry of body.entry || []) {
     for (const change of entry?.changes || []) {
-      await processChangePayload({ ...req.body, entry: [{ ...entry, changes: [change] }] });
+      try {
+        await processChangePayload({ ...body, entry: [{ ...entry, changes: [change] }] });
+      } catch (err) {
+        errors.push(err);
+      }
     }
   }
+  await prisma.webhookEvent
+    .update({
+      where: { id: event.id },
+      data: errors.length
+        ? { attempts: { increment: 1 }, lastError: String(errors[0].message || errors[0]).slice(0, 1000) }
+        : { attempts: { increment: 1 }, processedAt: new Date(), lastError: null },
+    })
+    .catch((err) => console.error(`Webhook: could not record outcome of event ${event.id}:`, err.message));
+  return errors.length === 0;
 };
 
 const processChangePayload = async (body) => {
@@ -389,12 +448,11 @@ const processChangePayload = async (body) => {
       return;
     }
 
-    const { phoneNumberId, phone, name, content, mediaId, messageType, rawType, isRecognized, whatsappMessageId, quotedWhatsappMessageId, replyId, buttonPayload } = extracted;
+    const { phoneNumberId, phone, name, content, mediaId, messageType, rawType, isRecognized, whatsappMessageId, sentAt, quotedWhatsappMessageId, replyId, buttonPayload } = extracted;
 
-    // Route to the line that received the message. Note the handler already
-    // returned 200 at the top of this function — every failure path below is
-    // retry-safe by construction, and must NOT become a non-200 response or
-    // Meta would retry it forever.
+    // Route to the line that received the message. Meta already has its 200
+    // (the delivery is saved); a failure below leaves the saved event
+    // unprocessed for jobs/webhookRecovery.js to retry.
     const number = await numbers.getByPhoneNumberId(phoneNumberId);
     if (!number) {
       const last = unknownNumberSeen.get(phoneNumberId) || 0;
@@ -460,10 +518,13 @@ const processChangePayload = async (body) => {
       });
       console.log("Webhook: customer", customer.id, "opted OUT of", number.label);
     } else if (optIntent === "IN") {
-      await prisma.customerOptOut.deleteMany({
-        where: { customerId: customer.id, whatsappNumberId: number.id },
+      // START undoes only what the customer did themselves (a STOP keyword, or
+      // WhatsApp's own stop). An opt-out a person on the team recorded, or one
+      // that came in with an import, stays until the team lifts it.
+      const { count } = await prisma.customerOptOut.deleteMany({
+        where: { customerId: customer.id, whatsappNumberId: number.id, source: { in: ["KEYWORD", "WHATSAPP"] } },
       });
-      console.log("Webhook: customer", customer.id, "opted IN to", number.label);
+      console.log("Webhook: customer", customer.id, count ? "opted IN to" : "sent START (no self opt-out to lift) on", number.label);
     }
 
     // Use upsert to avoid race condition when creating conversation
@@ -483,19 +544,31 @@ const processChangePayload = async (body) => {
       quotedMessageId = quoted?.id ?? null;
     }
 
-    const message = await prisma.message.create({
-      data: {
-        conversationId: conversation.id,
-        senderType: "CUSTOMER",
-        senderId: null,
-        content,
-        messageType,
-        mediaId,
-        whatsappMessageId,
-        quotedMessageId,
-        status: null,
-      },
-    });
+    let message;
+    try {
+      message = await prisma.message.create({
+        data: {
+          conversationId: conversation.id,
+          senderType: "CUSTOMER",
+          senderId: null,
+          content,
+          messageType,
+          mediaId,
+          whatsappMessageId,
+          quotedMessageId,
+          status: null,
+        },
+      });
+    } catch (err) {
+      // The same delivery handled twice at once (Meta re-sent it, or recovery
+      // re-ran it): the check above passed for both, the unique id lets only
+      // one through.
+      if (err.code === "P2002") {
+        console.log("Webhook: duplicate message ignored (concurrent), id:", whatsappMessageId);
+        return;
+      }
+      throw err;
+    }
     console.log("Webhook: saved message id", message.id, quotedMessageId ? `(reply to ${quotedMessageId})` : "");
 
     // Is this answering a campaign? Never allowed to break message intake: the
@@ -507,6 +580,10 @@ const processChangePayload = async (body) => {
         customerId: customer.id,
         whatsappNumberId: number.id,
         quotedWhatsappMessageId,
+        // The 7-day window is measured from when the customer sent it, so a
+        // message delivered late (phone offline, replayed webhook) is judged
+        // by its real time.
+        now: sentAt && sentAt <= new Date() ? sentAt : new Date(),
       });
       if (campaignReply) {
         // So the live bubble shows its "Reply to <campaign>" tag straight away.
@@ -540,6 +617,8 @@ const processChangePayload = async (body) => {
         lastMessageAt: new Date(),
         lastSenderType: "CUSTOMER",
         lastCustomerMessageAt: new Date(),
+        // Starts the "waiting for a reply" clock if it isn't running already.
+        ...patientWroteData(conversation),
         ...(reopening ? { status: "OPEN" } : {}),
       },
     });
@@ -573,7 +652,9 @@ const processChangePayload = async (body) => {
   } catch (err) {
     console.error("=== WEBHOOK PROCESSING ERROR ===");
     console.error(err);
+    // Re-thrown so the saved event stays unprocessed and recovery retries it.
+    throw err;
   }
 };
 
-module.exports = { verifyWebhook, receiveWhatsAppMessage };
+module.exports = { verifyWebhook, receiveWhatsAppMessage, processWebhookEvent };

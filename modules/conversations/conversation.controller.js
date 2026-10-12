@@ -202,6 +202,9 @@ const getConversationProfile = async (req, res, next) => {
       where: { id },
       select: {
         id: true, whatsappNumberId: true, status: true, createdAt: true, lastCustomerMessageAt: true,
+        awaitingReplySince: true, lastAgentReplyAt: true,
+        outcome: true, outcomeAt: true, followUpAt: true,
+        outcomeBy: { select: { id: true, name: true, username: true } },
         assignedAgent: { select: ASSIGNEE_SELECT },
         customer: true,
       },
@@ -212,7 +215,7 @@ const getConversationProfile = async (req, res, next) => {
     const customerId = conversation.customer.id;
     const notDeleted = { conversationId: id, deletedAt: null };
 
-    const [runs, mediaRows, mediaCounts, linkRows, campaigns, optOut, messageCount] = await Promise.all([
+    const [runs, mediaRows, mediaCounts, linkRows, campaigns, optOut, messageCount, bookings, notes] = await Promise.all([
       prisma.flowRun.findMany({
         where: { conversationId: id },
         orderBy: { startedAt: "desc" },
@@ -247,6 +250,19 @@ const getConversationProfile = async (req, res, next) => {
         select: { optedOutAt: true, source: true },
       }),
       prisma.message.count({ where: notDeleted }),
+      // Every appointment booked for this patient, from any chat or line.
+      prisma.booking.findMany({
+        where: { customerId },
+        orderBy: { appointmentAt: "desc" },
+        take: 20,
+        include: { createdBy: { select: { id: true, name: true, username: true } } },
+      }),
+      prisma.conversationNote.findMany({
+        where: { conversationId: id },
+        orderBy: { createdAt: "desc" },
+        take: 50,
+        include: { author: { select: { id: true, name: true, username: true } } },
+      }),
     ]);
 
     // Links: every URL a person would see in the chat, newest first, once each.
@@ -303,7 +319,15 @@ const getConversationProfile = async (req, res, next) => {
           lastCustomerMessageAt: conversation.lastCustomerMessageAt,
           assignedAgent: conversation.assignedAgent,
           messageCount,
+          awaitingReplySince: conversation.awaitingReplySince,
+          lastAgentReplyAt: conversation.lastAgentReplyAt,
+          outcome: conversation.outcome,
+          outcomeAt: conversation.outcomeAt,
+          outcomeBy: conversation.outcomeBy,
+          followUpAt: conversation.followUpAt,
         },
+        bookings,
+        notes,
         optOut,
         responses,
         media: mediaRows,
@@ -393,11 +417,35 @@ const assignConversation = async (req, res, next) => {
       return res.status(200).json({ success: true, data: unchanged });
     }
 
-    const conversation = await prisma.conversation.update({
-      where: { id: conversationId },
+    // Someone changed the owner since this person last saw the chat: say so
+    // instead of silently overwriting their decision. `expectedAgentId` is the
+    // owner the requester's screen showed (null = unassigned); omitted = no check.
+    const changedUnderneath = (current) => {
+      const who = current ? current.name || current.username : "nobody";
+      return new AppError(
+        `Someone just changed this chat's owner — it's now assigned to ${who}. Check before reassigning.`,
+        409,
+        "ASSIGNMENT_CHANGED",
+        { assignee: current ?? null },
+      );
+    };
+    const expectedGiven = Object.prototype.hasOwnProperty.call(req.body, "expectedAgentId");
+    const expected = req.body.expectedAgentId === null || req.body.expectedAgentId === undefined ? null : Number(req.body.expectedAgentId);
+    if (expectedGiven && expected !== existing.assignedAgentId) {
+      return next(changedUnderneath(existing.assignedAgent));
+    }
+
+    // Atomic: only if the owner is still the one just read. Two people
+    // reassigning at the same moment — exactly one wins, the other is told.
+    const { count } = await prisma.conversation.updateMany({
+      where: { id: conversationId, assignedAgentId: existing.assignedAgentId },
       data: { assignedAgentId: targetId },
-      include,
     });
+    if (count === 0) {
+      const now = await prisma.conversation.findUnique({ where: { id: conversationId }, select: { assignedAgent: { select: ASSIGNEE_SELECT } } });
+      return next(changedUnderneath(now?.assignedAgent ?? null));
+    }
+    const conversation = await prisma.conversation.findUnique({ where: { id: conversationId }, include });
 
     emitToNumber(req.numberId, "conversation.assigned", {
       conversationId,

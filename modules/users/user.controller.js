@@ -268,6 +268,25 @@ const updateMyStatus = async (req, res, next) => {
   }
 };
 
+// ── Self: change own display name ─────────────────────────────────────────────
+// The name colleagues see on assignments and replies. The username (login)
+// is changed by an admin, not here.
+const updateMyProfile = async (req, res, next) => {
+  try {
+    const name = String(req.body.name ?? "").trim();
+    if (!name) return next(new AppError("Name can't be empty", 400));
+    if (name.length > 60) return next(new AppError("Name must be 60 characters or fewer", 400));
+    const user = await prisma.user.update({
+      where: { id: req.user.id },
+      data: { name },
+      select: SAFE_SELECT,
+    });
+    res.status(200).json({ success: true, data: user });
+  } catch (err) {
+    next(err);
+  }
+};
+
 // ── Self: change own password ─────────────────────────────────────────────────
 const changeMyPassword = async (req, res, next) => {
   try {
@@ -279,7 +298,9 @@ const changeMyPassword = async (req, res, next) => {
 
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
     const isMatch = await bcryptjs.compare(currentPassword, user.passwordHash);
-    if (!isMatch) return next(new AppError("Current password is incorrect", 401));
+    // 400, not 401: the browser treats any 401 as "session expired" and signs
+    // the user out — a mistyped current password must just say so.
+    if (!isMatch) return next(new AppError("Current password is incorrect", 400, "WRONG_PASSWORD"));
 
     const passwordHash = await bcryptjs.hash(newPassword, 12);
     await prisma.user.update({ where: { id: req.user.id }, data: { passwordHash } });
@@ -291,6 +312,7 @@ const changeMyPassword = async (req, res, next) => {
 };
 
 module.exports = {
+  updateMyProfile,
   getAllUsers,
   getAssignableUsers,
   getUserById,

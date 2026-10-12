@@ -22,6 +22,7 @@ const prisma = require("../config/prisma");
 const numbers = require("./whatsappNumbers");
 const { sendWhatsAppMessage, sendTypingIndicator } = require("./whatsappClient");
 const { emitToNumber, emitToNumberStaff } = require("./socket");
+const { handedToTeam } = require("./followUp");
 const { isAssignable } = require("./conversationAssignment");
 const logAudit = require("./audit");
 const { nextNodeId, nodeById } = require("./flowGraph");
@@ -225,7 +226,9 @@ async function sendBot(ctx, { kind, text, mediaType, mediaUrl, footer, header, b
   const preview = prebuilt ? prebuilt.preview : kind === "list" || kind === "cards" || (buttons && buttons.length) ? text : content;
   await prisma.conversation.update({
     where: { id: conversation.id },
-    data: { lastMessage: preview, lastMessageAt: new Date(), lastSenderType: "BOT" },
+    // The bot answered, so the patient isn't waiting for a person (a hand-off
+    // starts that clock again).
+    data: { lastMessage: preview, lastMessageAt: new Date(), lastSenderType: "BOT", awaitingReplySince: null },
   });
   emitToNumber(numberId, "message.created", { message, conversationId: conversation.id });
   emitToNumber(numberId, "conversation.updated", { conversationId: conversation.id });
@@ -383,6 +386,8 @@ async function walk(ctx, run, graph, startNodeId) {
           details: { flowRunId: run.id, flowId: run.flowId, agentId: agent?.id ?? null },
         });
         data.path.push({ node: node.id, handedOffTo: agent?.username ?? "team", at: new Date().toISOString() });
+        // From now on the patient is waiting for a person.
+        await handedToTeam(ctx.conversation.id);
         return finish(run, "HANDED_OFF", { data });
       }
       case "end": {

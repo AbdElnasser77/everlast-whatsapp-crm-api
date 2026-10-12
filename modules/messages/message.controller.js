@@ -7,9 +7,12 @@ const { claimIfUnassigned } = require("../../utils/conversationAssignment");
 const { windowState, windowClosedError } = require("../../utils/messagingWindow");
 const numbers = require("../../utils/whatsappNumbers");
 const { handOffOnAgentReply } = require("../../utils/flowEngine");
+const { readClientMessageId, findDuplicateSend, isClientIdRace, assertMayReply } = require("../../utils/replyGuards");
 
 const sendMessage = async (req, res, next) => {
+  let clientMessageId = null;
   try {
+    clientMessageId = readClientMessageId(req.body.clientMessageId);
     const { conversationId, content, messageType = "TEXT", mediaUrl = null, quotedMessageId } = req.body;
 
     if (!conversationId) return next(new AppError("conversationId is required", 400));
@@ -18,7 +21,10 @@ const sendMessage = async (req, res, next) => {
 
     const conversation = await prisma.conversation.findUnique({
       where: { id: parseInt(conversationId) },
-      include: { customer: { select: { phone: true } } },
+      include: {
+        customer: { select: { phone: true } },
+        assignedAgent: { select: { id: true, name: true, username: true } },
+      },
     });
     if (!conversation) return next(new AppError("Conversation not found", 404));
 
@@ -44,6 +50,16 @@ const sendMessage = async (req, res, next) => {
       return next(windowClosedError(conversation.lastCustomerMessageAt));
     }
 
+    // Already sent under this id (double click / retry): return it, don't resend.
+    const quotedSelect = {
+      quotedMessage: { select: { id: true, content: true, messageType: true, senderType: true, mediaUrl: true, deletedAt: true } },
+    };
+    const duplicate = await findDuplicateSend(clientMessageId, conversation.id, quotedSelect);
+    if (duplicate) return res.status(200).json({ success: true, data: duplicate, duplicate: true });
+
+    // Someone else owns this chat: only with an explicit "reply anyway".
+    assertMayReply(conversation, req.user, req.body.confirmOtherOwner === true);
+
     const messageContent = content || mediaUrl;
 
     let quotedWhatsappMessageId = null;
@@ -65,6 +81,7 @@ const sendMessage = async (req, res, next) => {
         mediaId: null,
         mediaUrl: mediaUrl || null,
         whatsappMessageId: null,
+        ...(clientMessageId ? { clientMessageId } : {}),
         status: "PENDING",
         ...(quotedMessageId ? { quotedMessageId: parseInt(quotedMessageId) } : {}),
       },
@@ -113,6 +130,8 @@ const sendMessage = async (req, res, next) => {
         lastMessage: messageContent,
         lastMessageAt: new Date(),
         lastSenderType: "AGENT",
+        // A person answered: the patient is no longer waiting.
+        ...(message.status !== "FAILED" ? { awaitingReplySince: null, lastAgentReplyAt: new Date() } : {}),
       },
     });
 
@@ -130,6 +149,12 @@ const sendMessage = async (req, res, next) => {
 
     res.status(201).json({ success: true, data: message });
   } catch (err) {
+    // Two identical requests raced past the duplicate check: the unique id
+    // stopped the second; answer it with the first.
+    if (isClientIdRace(err, clientMessageId)) {
+      const first = await prisma.message.findUnique({ where: { clientMessageId } }).catch(() => null);
+      if (first) return res.status(200).json({ success: true, data: first, duplicate: true });
+    }
     next(err);
   }
 };

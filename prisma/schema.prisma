@@ -11,6 +11,36 @@ enum Role {
   ADMIN
   MARKETING
   AGENT
+  // An agent who also manages the agents: sees every chat and how it is
+  // going (waiting, booking progress, outcomes) on the Supervision page.
+  SUPERVISOR
+}
+
+// How a conversation ended up, set by the agent handling it. BOOKED always
+// comes with a Booking row (the appointment details).
+enum ConversationOutcome {
+  BOOKED
+  NOT_INTERESTED
+  FOLLOW_UP
+  NO_ANSWER
+}
+
+enum BookingStatus {
+  BOOKED
+  CANCELLED
+}
+
+// A patient's request to book, waiting for an agent to book it in Dok32.
+enum BookingRequestStatus {
+  NEW // nobody has picked it up
+  IN_PROGRESS // an agent opened it and is booking it
+  BOOKED // at least one appointment was booked from it
+  NOT_BOOKED // closed without an appointment (notBookedReason says why)
+}
+
+enum BookingRequestSource {
+  FLOW // the booking flow collected it
+  AGENT // an agent created it from a chat
 }
 
 enum SenderType {
@@ -65,6 +95,10 @@ enum TemplateApprovalStatus {
   SUBMITTED
   APPROVED
   REJECTED
+  // Meta stopped the template after approval (low quality or too many blocks).
+  // Neither can be sent; PAUSED may come back on its own (REINSTATED).
+  PAUSED
+  DISABLED
 }
 
 enum MessageStatus {
@@ -107,10 +141,25 @@ enum CampaignPauseReason {
   // payment, template problem, rate limit). Paused instead of burning the
   // audience; the recipients stay PENDING and Resume retries them.
   SEND_ERROR
+  // Meta's throughput limit. Resumed automatically at Campaign.resumeAt.
+  RATE_LIMIT
+  // Repeated network failures reaching Meta. Resumed automatically at
+  // Campaign.resumeAt; nobody is marked FAILED for a connection problem.
+  CONNECTION
+  // The template was deleted, paused or disabled. Needs a person: Resume
+  // re-checks it.
+  TEMPLATE_UNAVAILABLE
+  // The number's Meta quality rating dropped (Settings → Campaign safety).
+  // Needs a person: Resume re-checks the rating.
+  QUALITY
 }
 
 enum CampaignRecipientStatus {
   PENDING
+  // Claimed by a send loop: the Meta call is about to happen or in flight.
+  // A row still SENDING after its loop died is never resent — recovery marks
+  // it FAILED "Not confirmed", because Meta may already have delivered it.
+  SENDING
   SENT
   FAILED
   SKIPPED
@@ -157,6 +206,12 @@ model WhatsAppNumber {
   // line exists and a patient may still be talking on it.
   isActive           Boolean  @default(true)
   isDefault          Boolean  @default(false)
+  // Meta's health signal for this line, as of qualityCheckedAt
+  // (jobs/numberQualityWatch.js): GREEN / YELLOW / RED, and the account
+  // status (CONNECTED / FLAGGED / RESTRICTED / BANNED).
+  qualityRating      String?
+  metaStatus         String?
+  qualityCheckedAt   DateTime?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
@@ -213,6 +268,11 @@ model User {
   segments              Segment[]
   mediaAssets           MediaAsset[]
   flows                 Flow[]
+  outcomesSet       Conversation[]     @relation("ConversationOutcomes")
+  bookingsCreated   Booking[]          @relation("BookingsCreated")
+  conversationNotes ConversationNote[] @relation("ConversationNotes")
+  bookingRequestsClaimed BookingRequest[] @relation("BookingRequestsClaimed")
+  bookingRequestsHandled BookingRequest[] @relation("BookingRequestsHandled")
 }
 
 model MediaAsset {
@@ -256,6 +316,8 @@ model Customer {
   campaignRecipients CampaignRecipient[]
   listMemberships    ListMember[]
   flowRuns           FlowRun[]
+  bookings           Booking[]
+  bookingRequests    BookingRequest[]
 }
 
 model ContactList {
@@ -325,10 +387,26 @@ model Conversation {
   lastMessageAt         DateTime?
   lastSenderType        SenderType?
   lastCustomerMessageAt DateTime?
+  // When the patient started waiting for a person: their first message since
+  // a staff member (or the flow bot) last answered. Null = nobody is waiting.
+  // What "replied and no follow-up" is measured from.
+  awaitingReplySince    DateTime?
+  // The last time a staff member (not a campaign, not the bot) replied.
+  lastAgentReplyAt      DateTime?
+  // Set by the agent; see ConversationOutcome.
+  outcome               ConversationOutcome?
+  outcomeAt             DateTime?
+  outcomeById           Int?
+  outcomeBy             User?              @relation("ConversationOutcomes", fields: [outcomeById], references: [id], onDelete: SetNull)
+  // For FOLLOW_UP: when to get back to the patient.
+  followUpAt            DateTime?
   createdAt             DateTime           @default(now())
   updatedAt             DateTime           @updatedAt
   messages              Message[]
   flowRuns              FlowRun[]
+  bookings              Booking[]
+  bookingRequests       BookingRequest[]
+  notes                 ConversationNote[]
 
   // The composite unique is what `upsert` keys on in the webhook path, and what
   // permits a second conversation for the same customer on a different number.
@@ -339,6 +417,8 @@ model Conversation {
   @@index([whatsappNumberId, lastMessageAt, lastSenderType, status])
   @@index([whatsappNumberId, assignedAgentId, status])
   @@index([whatsappNumberId, status])
+  @@index([awaitingReplySince])
+  @@index([outcome, followUpAt])
 }
 
 model Message {
@@ -350,7 +430,10 @@ model Message {
   sender              User?               @relation(fields: [senderId], references: [id])
   content             String
   messageType         MessageType         @default(TEXT)
-  whatsappMessageId   String?
+  whatsappMessageId   String? @unique
+  // Set by the browser for each message a person sends; unique, so a double
+  // click or retry can never send the same message twice (utils/replyGuards.js).
+  clientMessageId     String?             @unique
   mediaId             String?
   mediaUrl            String?
   status              MessageStatus?
@@ -401,6 +484,10 @@ model Template {
   name             String
   metaTemplateName String?
   metaTemplateId   String?
+  // Meta's own category (MARKETING / UTILITY / AUTHENTICATION) as Meta last
+  // reported it — Meta can re-categorise an approved template, which changes
+  // what it costs and which limits apply.
+  metaCategory     String?
   category         TemplateCategory       @default(GENERAL)
   approvalStatus   TemplateApprovalStatus @default(DRAFT)
   rejectionReason  String?
@@ -449,12 +536,25 @@ model Campaign {
   pauseReason      CampaignPauseReason?
   // Human-readable reason for the pause (e.g. Meta's error), shown on the card.
   pauseDetail      String?
+  // When an automatic pause (RATE_LIMIT / CONNECTION) is resumed by the scheduler.
+  resumeAt         DateTime?
   scheduledAt      DateTime?
   startedAt        DateTime?
   completedAt      DateTime?
   sentCount        Int                  @default(0)
   failedCount      Int                  @default(0)
+  // Opted out (globally or on this line) by the time their turn came.
+  skippedCount     Int                  @default(0)
   totalRecipients  Int                  @default(0)
+  // Send-loop lease. Only the process holding an unexpired lease sends this
+  // campaign; it renews it on every heartbeat. A crashed or killed process
+  // stops renewing, and recovery takes the campaign over once it expires —
+  // so two server instances can never send the same campaign at once.
+  lockedBy         String?
+  lockedUntil      DateTime?
+  // Set when a COMPLETED campaign is deleted: hidden everywhere, but its
+  // recipients and reply links stay so the history and reporting survive.
+  deletedAt        DateTime?
   // Audience provenance. When a campaign is built from a segment, the segment
   // is resolved to concrete CampaignRecipient rows AT CREATION and frozen
   // there — the rule may keep evolving, but this campaign's audience does not.
@@ -488,6 +588,7 @@ model Campaign {
   @@index([whatsappNumberId, status])
   @@index([whatsappNumberId, category])
   @@index([status, pauseReason])
+  bookingRequests  BookingRequest[]
 }
 
 model CampaignRecipient {
@@ -502,6 +603,9 @@ model CampaignRecipient {
   messageId  Int?
   message    Message?                @relation("RecipientSentMessage", fields: [messageId], references: [id], onDelete: SetNull)
   error      String?
+  // Send attempts that reached the claim step. Caps retries of one recipient.
+  attempts   Int                     @default(0)
+  claimedAt  DateTime?
   sentAt     DateTime?
   // When this recipient first replied to the campaign. Set once, by the webhook,
   // and never moved — it is what "Replied" counts.
@@ -510,6 +614,8 @@ model CampaignRecipient {
   createdAt  DateTime                @default(now())
 
   @@index([campaignId])
+  // One row per person per campaign: a duplicate would be messaged twice.
+  @@unique([campaignId, customerId])
   // Serves the webhook's attribution lookup: this customer's recent campaigns.
   @@index([customerId, sentAt])
   @@index([messageId])
@@ -587,4 +693,117 @@ model FlowRun {
 
   @@index([conversationId, status])
   @@index([flowId, startedAt])
+}
+
+// Every webhook delivery from Meta, saved BEFORE Meta is told "200 OK". Meta
+// never re-sends a delivery it got a 200 for, so this row is the only copy if
+// the process dies before it is handled. processedAt is set once handling
+// finished; jobs/webhookRecovery.js re-runs rows left unprocessed. Handling is
+// idempotent (Message.whatsappMessageId is unique), so a re-run never
+// duplicates a message.
+model WebhookEvent {
+  id          Int       @id @default(autoincrement())
+  payload     Json
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+  attempts    Int       @default(0)
+  lastError   String?
+
+  @@index([processedAt, receivedAt])
+}
+
+// Workspace settings an admin changes from the Settings page (quiet hours,
+// campaign safety limits). One row per setting; value is the setting's JSON.
+// Read through utils/appSettings.js, which caches them and falls back to the
+// built-in defaults for anything never saved.
+model AppSetting {
+  key         String   @id
+  value       Json
+  updatedAt   DateTime @updatedAt
+  updatedById Int?
+}
+
+// An appointment an agent booked for a patient from a chat (outcome BOOKED).
+// Kept as history: a patient can have many over time; a cancelled one stays,
+// marked CANCELLED.
+model Booking {
+  id               Int           @id @default(autoincrement())
+  conversationId   Int
+  conversation     Conversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  customerId       Int
+  customer         Customer      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  whatsappNumberId Int
+  // The request it was booked from, and the campaign that request came from.
+  requestId        Int?
+  request          BookingRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  campaignId       Int?
+  createdById      Int?
+  createdBy        User?         @relation("BookingsCreated", fields: [createdById], references: [id], onDelete: SetNull)
+  appointmentAt    DateTime
+  service          String?
+  doctor           String?
+  // The appointment's reference in Dok32, if the agent noted it.
+  dok32Ref         String?
+  note             String?
+  status           BookingStatus @default(BOOKED)
+  cancelledAt      DateTime?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  @@index([customerId, appointmentAt])
+  @@index([createdAt])
+  @@index([appointmentAt])
+  @@index([requestId])
+  @@index([campaignId])
+}
+
+// "This patient wants to book": created by the booking flow (or an agent),
+// handled by an agent who books it in Dok32 and records the appointment(s).
+model BookingRequest {
+  id               Int                  @id @default(autoincrement())
+  conversationId   Int
+  conversation     Conversation         @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  customerId       Int
+  customer         Customer             @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  whatsappNumberId Int
+  source           BookingRequestSource
+  // Where it came from: the campaign (if any) and the flow run that collected it.
+  campaignId       Int?
+  campaign         Campaign?            @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  flowRunId        Int?                 @unique
+  // What the patient asked for, as collected: { service, preferred_date, … }.
+  requested        Json                 @default("{}")
+  note             String?
+  status           BookingRequestStatus @default(NEW)
+  claimedById      Int?
+  claimedBy        User?                @relation("BookingRequestsClaimed", fields: [claimedById], references: [id], onDelete: SetNull)
+  claimedAt        DateTime?
+  handledById      Int?
+  handledBy        User?                @relation("BookingRequestsHandled", fields: [handledById], references: [id], onDelete: SetNull)
+  handledAt        DateTime?
+  // For NOT_BOOKED: NO_ANSWER | NOT_INTERESTED | PRICE | CALL_BACK_LATER | BOOKED_ELSEWHERE | OTHER
+  notBookedReason  String?
+  notBookedNote    String?
+  createdById      Int?
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+  bookings         Booking[]
+
+  @@index([whatsappNumberId, status, createdAt])
+  @@index([status, createdAt])
+  @@index([conversationId])
+  @@index([campaignId])
+}
+
+// A staff-only note on a chat ("call her back at 5"). Never sent to the patient.
+model ConversationNote {
+  id             Int          @id @default(autoincrement())
+  conversationId Int
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  authorId       Int?
+  author         User?        @relation("ConversationNotes", fields: [authorId], references: [id], onDelete: SetNull)
+  body           String
+  createdAt      DateTime     @default(now())
+
+  @@index([conversationId, createdAt])
 }

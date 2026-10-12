@@ -23,14 +23,34 @@ function parseHHMM(value) {
   return h * 60 + min;
 }
 
+// Saved from Settings → Quiet hours, if an admin ever saved it. Required
+// lazily so this module stays usable without a database (its own check).
+function savedQuietHours() {
+  // The checks pin quiet hours through env; a saved setting must not win there.
+  if (process.env.QUIET_HOURS_FORCE_ENV === "1") return null;
+  try {
+    return require("./appSettings").getSetting("quietHours");
+  } catch {
+    return null;
+  }
+}
+
 function getQuietHoursConfig() {
+  // The Settings page wins over the server config once it has been saved.
+  const saved = savedQuietHours();
+  if (saved) {
+    const startMin = parseHHMM(saved.start);
+    const endMin = parseHHMM(saved.end);
+    const enabled = saved.enabled && startMin !== null && endMin !== null && startMin !== endMin;
+    return { start: saved.start, end: saved.end, timezone: saved.timezone, enabled, startMin, endMin, source: "settings" };
+  }
   const start = process.env.QUIET_HOURS_START ?? DEFAULTS.start;
   const end = process.env.QUIET_HOURS_END ?? DEFAULTS.end;
   const timezone = process.env.QUIET_HOURS_TZ || DEFAULTS.timezone;
   const startMin = parseHHMM(start);
   const endMin = parseHHMM(end);
   const enabled = startMin !== null && endMin !== null && startMin !== endMin;
-  return { start, end, timezone, enabled, startMin, endMin };
+  return { start, end, timezone, enabled, startMin, endMin, source: "server" };
 }
 
 // Minutes since local midnight in the configured timezone.
@@ -63,4 +83,4 @@ function nextSendWindowOpen(date = new Date(), config = getQuietHoursConfig()) {
   return new Date(startOfMinute + minutesLeft * 60000);
 }
 
-module.exports = { getQuietHoursConfig, isQuietHours, nextSendWindowOpen };
+module.exports = { getQuietHoursConfig, isQuietHours, nextSendWindowOpen, localMinuteOfDay };

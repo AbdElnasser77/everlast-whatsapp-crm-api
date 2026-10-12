@@ -22,6 +22,8 @@ const {
   testSendTemplate,
   refreshCampaignAudience,
   setCampaignFlow,
+  getCampaignCapacity,
+  getPendingApprovals,
 } = require("./campaign.controller");
 
 const router = express.Router();
@@ -45,6 +47,8 @@ router.get("/", requirePermission("campaign:read"), getCampaigns);
 // as an :id param and route it to getCampaign instead.
 router.get("/active-progress", requirePermission("campaign:read"), getActiveCampaignProgress);
 router.get("/quiet-hours", requirePermission("campaign:read"), getQuietHours);
+// Waiting for approval, all numbers — admins (campaign:send) only.
+router.get("/pending-approval", requirePermission("campaign:send"), getPendingApprovals);
 
 // ── Collection-level writes (must precede "/:id") ──────────────────────────
 // Must come before "/:id" so "bulk-delete" isn't captured as an :id param.
@@ -59,6 +63,8 @@ router.use("/flows", require("../flows/flow.routes"));
 
 router.get("/:id", requirePermission("campaign:read"), getCampaign);
 router.get("/:id/replies", requirePermission("campaign:read"), getCampaignReplies);
+// Meta daily messaging limit vs. what this campaign still needs.
+router.get("/:id/capacity", requirePermission("campaign:read"), getCampaignCapacity);
 
 // ── Building: agent-accessible, stage-checked in the controller ────────────
 router.post("/", requirePermission("campaign:write"), createCampaign);

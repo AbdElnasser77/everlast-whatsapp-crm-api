@@ -52,6 +52,35 @@ const ENDPOINTS = [
   ["POST", `/api/campaigns/${NOPE}/resume`, "campaign:control"],
   ["POST", `/api/campaigns/${NOPE}/cancel`, "campaign:control"],
   ["POST", "/api/campaigns/bulk-delete", "campaign:control"],
+  ["GET", "/api/campaigns/pending-approval", "campaign:send"],
+  ["GET", `/api/campaigns/${NOPE}/capacity`, "campaign:read"],
+  // settings (admin only). Not "check quality now": past the guard it really
+  // calls Meta, which this check must never do.
+  ["GET", "/api/settings", "settings:write"],
+  ["PUT", "/api/settings/quietHours", "settings:write"],
+  ["PUT", "/api/settings/campaignSafety", "settings:write"],
+  ["GET", "/api/settings/numbers", "number:write"],
+  ["POST", "/api/settings/numbers", "number:write"],
+  ["PUT", `/api/settings/numbers/${NOPE}`, "number:write"],
+  // supervision (supervisors, admins)
+  ["GET", "/api/supervision/overview", "team:supervise"],
+  ["GET", "/api/supervision/conversations", "team:supervise"],
+  ["GET", `/api/supervision/conversations/${NOPE}`, "team:supervise"],
+  ["GET", "/api/supervision/bookings", "team:supervise"],
+  // chat outcome + notes
+  ["PUT", `/api/conversations/${NOPE}/outcome`, "conversation:write"],
+  ["POST", `/api/conversations/${NOPE}/bookings/${NOPE}/cancel`, "conversation:write"],
+  ["GET", `/api/conversations/${NOPE}/notes`, "conversation:read"],
+  ["POST", `/api/conversations/${NOPE}/notes`, "conversation:write"],
+  // booking requests
+  ["GET", "/api/booking-requests", "conversation:read"],
+  ["GET", "/api/booking-requests/counts", "conversation:read"],
+  ["GET", `/api/booking-requests/${NOPE}`, "conversation:read"],
+  ["POST", `/api/booking-requests/${NOPE}/claim`, "conversation:write"],
+  ["POST", `/api/booking-requests/${NOPE}/book`, "conversation:write"],
+  ["POST", `/api/booking-requests/${NOPE}/not-booked`, "conversation:write"],
+  ["POST", `/api/booking-requests/${NOPE}/reopen`, "conversation:write"],
+  ["POST", `/api/conversations/${NOPE}/booking-requests`, "conversation:write"],
   // contacts
   ["GET", "/api/customers", "contact:read"],
   ["GET", `/api/customers/${NOPE}`, "contact:read"],

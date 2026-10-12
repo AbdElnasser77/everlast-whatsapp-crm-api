@@ -7,10 +7,22 @@
 // parameter building must therefore use the exact same ordering — which is why
 // both live here.
 
+// Meta rejects a template parameter that contains a newline or tab, or more
+// than four spaces in a row (error 132018 / 100) — and that rejection used to
+// look like an account-wide problem and pause the whole campaign over one
+// patient's badly typed name. Every value is cleaned to a single line, and an
+// empty result falls back to the default.
+const cleanParam = (value, fallback) => {
+  const v = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return v || fallback;
+};
+
 const RESOLVERS = {
-  first_name: (customer) => (customer?.name ? customer.name.split(" ")[0] : "Customer"),
-  customer_name: (customer) => customer?.name || "Customer",
-  agent_name: (_customer, agent) => agent?.name || agent?.username || "Team",
+  first_name: (customer) => cleanParam(cleanParam(customer?.name, "").split(" ")[0], "Customer"),
+  customer_name: (customer) => cleanParam(customer?.name, "Customer"),
+  agent_name: (_customer, agent) => cleanParam(agent?.name || agent?.username, "Team"),
 };
 
 const VAR_RE = /\{\{\s*([a-z_]+)\s*\}\}/gi;
@@ -62,6 +74,7 @@ const listPlaceholders = (text) => [...String(text || "").matchAll(ANY_PLACEHOLD
 const SUPPORTED_VARS = Object.keys(RESOLVERS);
 
 module.exports = {
+  cleanParam,
   SUPPORTED_VARS,
   listPlaceholders,
   extractOrderedVars,

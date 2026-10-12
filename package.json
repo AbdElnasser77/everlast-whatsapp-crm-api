@@ -15,7 +15,12 @@
     "check:scoping": "node tests/scoping.check.js",
     "check:roles": "node tests/roles.check.js",
     "check:inbox": "node tests/inbox.check.js",
-    "check:quiet-hours": "node tests/quietHours.check.js"
+    "check:quiet-hours": "node tests/quietHours.check.js",
+    "check:campaigns": "node tests/campaigns.check.js",
+    "check:approval-settings": "node tests/approvalSettings.check.js",
+    "check:webhooks": "node tests/webhooks.check.js",
+    "check:supervision": "node tests/supervision.check.js",
+    "check:booking-requests": "node tests/bookingRequests.check.js"
   },
   "keywords": [],
   "author": "",

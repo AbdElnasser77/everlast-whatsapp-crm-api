@@ -69,6 +69,11 @@ const ALL_PERMISSIONS = [
   "number:read",
   "number:use_any",
   "number:write",
+  // Workspace settings (quiet hours, campaign safety limits). ADMIN only, via "*".
+  "settings:write",
+  // The Supervision page: every agent's chats, who is waiting, booking
+  // progress, outcomes. SUPERVISOR and ADMIN.
+  "team:supervise",
   // Development tools (the message/cost tracker). ADMIN only, via "*"; the
   // /api/dev routes also don't exist in production at all.
   "dev:tools",
@@ -99,10 +104,30 @@ const ROLE_PERMISSIONS = {
     // admin-only bottleneck on every send.
     "segment:read", "segment:write",
     "template:read", "template:write",
-    "campaign:read", "campaign:write", "campaign:send", "campaign:control",
+    // No campaign:send: marketing builds campaigns and submits them; an admin
+    // approves (which sends or schedules) or rejects them with a reason.
+    // campaign:control stays — pausing or cancelling a send is always safe.
+    "campaign:read", "campaign:write", "campaign:control",
     "media:read", "media:write",
     "user:read", // agent names for reporting filters; user:write stays ADMIN
     "stats:read", "audit:read", "number:read", "number:use_any",
+  ],
+
+  // An agent who also manages the agents. Everything an agent does, plus the
+  // Supervision page (all chats, waiting times, bookings, outcomes) and
+  // read-only campaign results and stats. Settings stay ADMIN-only.
+  SUPERVISOR: [
+    "conversation:read", "conversation:write", "conversation:assign",
+    "message:send", "message:delete_own",
+    "contact:read", "contact:write",
+    "list:read",
+    "segment:read",
+    "template:read",
+    "media:upload", "media:read",
+    "number:read", "number:use_any",
+    "team:supervise",
+    "campaign:read",
+    "stats:read",
   ],
 
   AGENT: [

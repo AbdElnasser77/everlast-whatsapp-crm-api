@@ -7,6 +7,7 @@ const numbers = require("../../utils/whatsappNumbers");
 const { emitToNumber } = require("../../utils/socket");
 const { claimIfUnassigned } = require("../../utils/conversationAssignment");
 const { handOffOnAgentReply } = require("../../utils/flowEngine");
+const { readClientMessageId, findDuplicateSend, isClientIdRace, assertMayReply } = require("../../utils/replyGuards");
 const { buildTemplateSend } = require("../../utils/templateSend");
 const { windowState, windowClosedError } = require("../../utils/messagingWindow");
 const { describeMetaTemplateError } = require("../../utils/metaErrors");
@@ -378,14 +379,24 @@ const deleteTemplate = async (req, res, next) => {
     if (!existing || !existing.isActive) return next(new AppError("Template not found", 404));
 
     // Deleting at Meta stops every send of this template, so refuse while a
-    // campaign still needs it rather than failing that campaign mid-send.
-    const inUse = await prisma.campaign.count({
-      where: { templateId: id, status: { in: ["SCHEDULED", "RUNNING", "PAUSED"] } },
+    // campaign still needs it rather than failing that campaign mid-send —
+    // including drafts and ones waiting for approval, which would otherwise
+    // be approved and then fail on their first send.
+    const users = await prisma.campaign.findMany({
+      where: {
+        templateId: id,
+        deletedAt: null,
+        status: { in: ["DRAFT", "PENDING_APPROVAL", "SCHEDULED", "RUNNING", "PAUSED"] },
+      },
+      select: { name: true, status: true },
+      take: 5,
     });
-    if (inUse > 0) {
+    if (users.length > 0) {
+      const names = users.map((c) => `"${c.name}" (${c.status.toLowerCase().replace("_", " ")})`).join(", ");
       return next(new AppError(
-        `${inUse} scheduled, running or paused campaign(s) still use this template — finish or cancel them first`,
+        `Campaigns still use this template: ${names}${users.length === 5 ? " and maybe more" : ""}. Finish, cancel or delete them first.`,
         409,
+        "TEMPLATE_IN_USE",
       ));
     }
 
@@ -588,7 +599,9 @@ const syncApprovalStatus = async (req, res, next) => {
 };
 
 const sendTemplate = async (req, res, next) => {
+  let clientMessageId = null;
   try {
+    clientMessageId = readClientMessageId(req.body.clientMessageId);
     const conversationId = parseInt(req.params.id);
     const { templateId } = req.body;
     if (!templateId) return next(new AppError("templateId is required", 400));
@@ -629,6 +642,10 @@ const sendTemplate = async (req, res, next) => {
       return next(windowClosedError(conversation.lastCustomerMessageAt));
     }
 
+    const duplicate = await findDuplicateSend(clientMessageId, conversation.id);
+    if (duplicate) return res.status(200).json({ success: true, data: duplicate, duplicate: true });
+    assertMayReply(conversation, req.user, req.body.confirmOtherOwner === true);
+
     // This block used to duplicate utils/templateSend.js inline. Two copies meant
     // every number-aware fix had to be made twice, and a test send would stop
     // being evidence about the real send the moment they drifted.
@@ -643,6 +660,7 @@ const sendTemplate = async (req, res, next) => {
         conversationId,
         senderType: "AGENT",
         senderId: parseInt(req.user.id),
+        ...(clientMessageId ? { clientMessageId } : {}),
         content: templateContent,
         // Was hardcoded to INTERACTIVE even when the send was a TEMPLATE or TEXT.
         messageType: sendArgs.messageType,
@@ -671,6 +689,8 @@ const sendTemplate = async (req, res, next) => {
         lastMessage: resolvedBody,
         lastMessageAt: new Date(),
         lastSenderType: "AGENT",
+        // A person answered: the patient is no longer waiting.
+        ...(message.status !== "FAILED" ? { awaitingReplySince: null, lastAgentReplyAt: new Date() } : {}),
       },
     });
 
@@ -687,6 +707,10 @@ const sendTemplate = async (req, res, next) => {
 
     res.status(201).json({ success: true, data: message });
   } catch (err) {
+    if (isClientIdRace(err, clientMessageId)) {
+      const first = await prisma.message.findUnique({ where: { clientMessageId } }).catch(() => null);
+      if (first) return res.status(200).json({ success: true, data: first, duplicate: true });
+    }
     next(err);
   }
 };

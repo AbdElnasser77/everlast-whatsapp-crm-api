@@ -12,6 +12,7 @@ const {
   getAssignableUsers,
   updateMyStatus,
   changeMyPassword,
+  updateMyProfile,
 } = require("./user.controller");
 
 const router = express.Router();
@@ -24,6 +25,7 @@ router.get("/me", getMe);
 router.get("/assignable", requirePermission("conversation:assign"), getAssignableUsers);
 router.put("/me/status", updateMyStatus);
 router.put("/me/password", changeMyPassword);
+router.put("/me", updateMyProfile);
 
 // Admin only
 router.get("/", requirePermission("user:read"), getAllUsers);
