@@ -13,6 +13,7 @@ const {
   updateMyStatus,
   changeMyPassword,
   updateMyProfile,
+  handOverMine,
 } = require("./user.controller");
 
 const router = express.Router();
@@ -26,6 +27,8 @@ router.get("/assignable", requirePermission("conversation:assign"), getAssignabl
 router.put("/me/status", updateMyStatus);
 router.put("/me/password", changeMyPassword);
 router.put("/me", updateMyProfile);
+// End of shift: my open chats and booking requests to a colleague or the queue.
+router.post("/me/hand-over", requirePermission("conversation:write"), handOverMine);
 
 // Admin only
 router.get("/", requirePermission("user:read"), getAllUsers);

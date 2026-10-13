@@ -21,7 +21,8 @@ process.env.QUIET_HOURS_START = "00:00";
 process.env.QUIET_HOURS_END = "00:00";
 process.env.QUIET_HOURS_FORCE_ENV = "1";
 process.env.APP_SETTINGS_IGNORE_SAVED = "1";
-process.env.CAMPAIGN_LEASE_MS = "10000";
+// Renewals against Neon can take several seconds under send load; 10s was too tight.
+process.env.CAMPAIGN_LEASE_MS = "20000";
 process.env.CAMPAIGN_HEARTBEAT_MS = "1000";
 process.env.WHATSAPP_TOKEN_CAMPAIGNCHECK = "fake-token";
 // Error handling on a short clock: retries, auto-resume and per-person
@@ -167,10 +168,12 @@ function spawnChild(campaignId, { script = {}, delayMs = 30 } = {}) {
   const log = path.join(tmpDir, `child-${campaignId}-${Math.random().toString(36).slice(2)}.log`);
   const child = spawn(process.execPath, [path.join(__dirname, "campaigns.child.js"), String(campaignId)], {
     env: { ...process.env, FAKE_META_LOG: log, FAKE_META_SCRIPT: JSON.stringify(script), FAKE_META_DELAY_MS: String(delayMs) },
-    stdio: ["ignore", "ignore", "pipe"],
+    stdio: ["ignore", "pipe", "pipe"],
   });
   let stderr = "";
   child.stderr.on("data", (d) => { stderr += d; });
+  // stdout too: "not starting" / lease messages explain a loop that sent nothing.
+  child.stdout.on("data", (d) => { stderr += d; });
   const exited = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal, stderr })));
   return { child, log, exited };
 }

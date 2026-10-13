@@ -21,6 +21,8 @@ const VIEWS = {
   // Has at least one message that answers a campaign (see the attribution rule
   // in modules/webhooks/webhook.controller.js).
   campaign_replies: () => ({ messages: { some: { campaignRecipientId: { not: null } } }, ...NOT_RESOLVED }),
+  // My follow-ups: chats I own (or set to Follow up), soonest due first.
+  follow_ups: (req) => ({ outcome: "FOLLOW_UP", OR: [{ assignedAgentId: req.user.id }, { assignedAgentId: null, outcomeById: req.user.id }] }),
 };
 
 const getAllConversations = async (req, res, next) => {
@@ -71,7 +73,7 @@ const getAllConversations = async (req, res, next) => {
         // "last"`, every conversation that never actually got a message
         // (e.g. a campaign recipient whose send failed before ever writing
         // lastMessageAt) would rank above every real, active conversation.
-        orderBy: { lastMessageAt: { sort: "desc", nulls: "last" } },
+        orderBy: view === "follow_ups" ? { followUpAt: { sort: "asc", nulls: "last" } } : { lastMessageAt: { sort: "desc", nulls: "last" } },
         skip,
         take: limit,
       }),
@@ -93,12 +95,16 @@ const getAllConversations = async (req, res, next) => {
 const getConversationCounts = async (req, res, next) => {
   try {
     const entries = await Promise.all(
-      ["mine", "unassigned", "campaign_replies"].map(async (view) => [
+      ["mine", "unassigned", "campaign_replies", "follow_ups"].map(async (view) => [
         view,
         await prisma.conversation.count({ where: { whatsappNumberId: req.numberId, ...VIEWS[view](req) } }),
       ]),
     );
-    res.status(200).json({ success: true, data: Object.fromEntries(entries) });
+    // Follow-ups that are due now (or overdue) — what the badge shows.
+    const followUpsDue = await prisma.conversation.count({
+      where: { whatsappNumberId: req.numberId, ...VIEWS.follow_ups(req), followUpAt: { lte: new Date() } },
+    });
+    res.status(200).json({ success: true, data: { ...Object.fromEntries(entries), follow_ups_due: followUpsDue } });
   } catch (err) {
     next(err);
   }

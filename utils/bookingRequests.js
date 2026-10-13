@@ -302,9 +302,21 @@ async function bookRequest(requestId, appointments, user, scope = {}, source = n
   return result;
 }
 
-async function closeNotBooked(requestId, { reason, note }, user, scope = {}) {
+// Couldn't book → the chat's outcome follows, so the two never disagree:
+//   not interested / price / booked elsewhere → Not interested
+//   no answer → No answer
+//   will call back later → Follow up on `followUpAt` (required)
+//   other → the outcome is left as it is.
+const OUTCOME_FOR_REASON = { NOT_INTERESTED: "NOT_INTERESTED", PRICE: "NOT_INTERESTED", BOOKED_ELSEWHERE: "NOT_INTERESTED", NO_ANSWER: "NO_ANSWER", CALL_BACK_LATER: "FOLLOW_UP" };
+
+async function closeNotBooked(requestId, { reason, note, followUpAt }, user, scope = {}, { syncOutcome = true } = {}) {
   if (!NOT_BOOKED_REASONS.includes(reason)) throw new AppError(`Pick a reason: ${NOT_BOOKED_REASONS.join(", ")}`, 400);
   if (reason === "OTHER" && !String(note || "").trim()) throw new AppError("Say what happened", 400);
+  let callBack = null;
+  if (syncOutcome && reason === "CALL_BACK_LATER") {
+    callBack = followUpAt ? new Date(followUpAt) : null;
+    if (!callBack || Number.isNaN(callBack.getTime())) throw new AppError("Choose when to call them back", 400, "FOLLOW_UP_REQUIRED");
+  }
   const request = await prisma.bookingRequest.findFirst({ where: { id: requestId, ...scope } });
   if (!request) throw new AppError("Booking request not found", 404);
   const live = await prisma.booking.count({ where: { requestId: request.id, status: "BOOKED" } });
@@ -315,6 +327,29 @@ async function closeNotBooked(requestId, { reason, note }, user, scope = {}) {
   });
   logAudit({ action: "booking_request.not_booked", actor: user, targetType: "conversation", targetId: request.conversationId, details: { requestId: request.id, reason } });
   emitChange(updated);
+
+  const outcome = syncOutcome ? OUTCOME_FOR_REASON[reason] : null;
+  if (outcome) {
+    // Not if another request on this chat still has booked appointments —
+    // then the chat really is "Booked".
+    const liveElsewhere = await prisma.booking.count({ where: { conversationId: request.conversationId, status: "BOOKED" } });
+    if (liveElsewhere === 0) {
+      const now = new Date();
+      const before = await prisma.conversation.findUnique({ where: { id: request.conversationId }, select: { outcome: true } });
+      await prisma.conversation.update({
+        where: { id: request.conversationId },
+        data: { outcome, outcomeAt: now, outcomeById: user.id, followUpAt: outcome === "FOLLOW_UP" ? callBack : null, followUpNotifiedAt: null },
+      });
+      logAudit({
+        action: "conversation.outcome_set",
+        actor: user,
+        targetType: "conversation",
+        targetId: request.conversationId,
+        details: { outcome, previousOutcome: before?.outcome ?? null, requestId: request.id, followUpAt: outcome === "FOLLOW_UP" ? callBack : null, via: "couldn't book" },
+      });
+      emitToNumber(request.whatsappNumberId, "conversation.outcome", { conversationId: request.conversationId, outcome });
+    }
+  }
   return updated;
 }
 

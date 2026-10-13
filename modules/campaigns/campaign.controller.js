@@ -349,16 +349,31 @@ async function runCampaign(campaignId) {
 
   let progressDirty = false;
 
-  let beating = false;
-  const heartbeat = setInterval(async () => {
-    if (beating) return;
-    beating = true;
+  // The lease is renewed on its own timer: queued behind the status read and
+  // the progress recount (which wait on the same campaign row as every send),
+  // a renewal could slip long enough for the loop to stop itself.
+  let renewing = false;
+  const renewal = setInterval(async () => {
+    if (renewing) return;
+    renewing = true;
     try {
       const renewed = await prisma.campaign.updateMany({
         where: { id: campaignId, lockedBy: INSTANCE_ID },
         data: { lockedUntil: new Date(Date.now() + LEASE_MS) },
       });
       if (renewed.count === 1) lastRenewedAt = Date.now();
+    } catch (err) {
+      console.error(`[Campaign ${campaignId}] lease renewal failed:`, err.message);
+    } finally {
+      renewing = false;
+    }
+  }, HEARTBEAT_MS);
+
+  let beating = false;
+  const heartbeat = setInterval(async () => {
+    if (beating) return;
+    beating = true;
+    try {
       const row = await prisma.campaign.findUnique({
         where: { id: campaignId },
         select: { status: true, lockedBy: true, whatsappNumber: { select: { isActive: true } } },
@@ -805,6 +820,7 @@ async function runCampaign(campaignId) {
     console.error(`[Campaign ${campaignId}] gave up after too many passes — left RUNNING for recovery`);
   } finally {
     clearInterval(heartbeat);
+    clearInterval(renewal);
     if (progressDirty) await recountCampaign(campaignId, numberId).catch(() => {});
   }
 }

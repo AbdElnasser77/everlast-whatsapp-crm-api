@@ -8,6 +8,7 @@ const { beginShutdown } = require("./modules/campaigns/campaign.controller");
 const { startTemplateStatusSync } = require("./jobs/templateStatusSync");
 const { startWebhookRecovery } = require("./jobs/webhookRecovery");
 const { startNumberQualityWatch } = require("./jobs/numberQualityWatch");
+const { startFollowUpReminders } = require("./jobs/followUpReminders");
 const { loadSettings } = require("./utils/appSettings");
 const whatsappNumbers = require("./utils/whatsappNumbers");
 const prisma = require("./config/prisma");
@@ -32,6 +33,7 @@ connectDB().then(async () => {
     startTemplateStatusSync();
     startWebhookRecovery();
     startNumberQualityWatch();
+    startFollowUpReminders();
   });
 });
 

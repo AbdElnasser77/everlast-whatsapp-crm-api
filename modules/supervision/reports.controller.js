@@ -207,7 +207,7 @@ const getTeamReport = async (req, res, next) => {
           openChatsNow: openNow.get(u.id) || 0,
         };
       })
-      .filter((a) => a.replies || a.appointmentsBooked || a.requestsTaken || a.notesWritten || Object.keys(a.outcomes).length)
+      .filter((a) => a.replies || a.firstResponses || a.appointmentsBooked || a.requestsTaken || a.requestsBooked || a.requestsNotBooked || a.notesWritten || Object.keys(a.outcomes).length)
       .sort((a, b) => b.replies - a.replies);
 
     // Day by day for the whole team.
@@ -396,7 +396,8 @@ const getChatsReport = async (req, res, next) => {
           assignedAgent: PERSON,
           outcomeBy: PERSON,
           bookingRequests: { orderBy: { createdAt: "desc" }, take: 1, select: { status: true, notBookedReason: true, leadSource: true, sourceStatus: true, campaign: { select: { name: true } } } },
-          _count: { select: { notes: true, bookings: true } },
+          // Appointments still booked (cancelled ones don't count, as in every other report).
+          _count: { select: { notes: true, bookings: { where: { status: "BOOKED" } } } },
         },
       }),
       responseTimes(period.from, line, period.to),

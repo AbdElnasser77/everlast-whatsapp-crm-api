@@ -400,6 +400,9 @@ model Conversation {
   outcomeBy             User?              @relation("ConversationOutcomes", fields: [outcomeById], references: [id], onDelete: SetNull)
   // For FOLLOW_UP: when to get back to the patient.
   followUpAt            DateTime?
+  // When the "follow-up due" reminder went out for the current followUpAt
+  // (cleared whenever the follow-up is set again), so it is sent once.
+  followUpNotifiedAt    DateTime?
   createdAt             DateTime           @default(now())
   updatedAt             DateTime           @updatedAt
   messages              Message[]

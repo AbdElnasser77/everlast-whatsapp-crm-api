@@ -150,7 +150,7 @@ const getSourceOptions = async (req, res, next) => {
 // ─── POST /api/booking-requests/:id/not-booked { reason, note? } ────────────
 const notBooked = async (req, res, next) => {
   try {
-    const r = await br.closeNotBooked(parseInt(req.params.id), { reason: req.body?.reason, note: req.body?.note }, req.user, scopeOf(req));
+    const r = await br.closeNotBooked(parseInt(req.params.id), { reason: req.body?.reason, note: req.body?.note, followUpAt: req.body?.followUpAt }, req.user, scopeOf(req));
     await reply(res, r.id);
   } catch (err) {
     next(err);

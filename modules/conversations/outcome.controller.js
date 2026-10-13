@@ -46,7 +46,21 @@ const setOutcome = async (req, res, next) => {
     }
 
     const now = new Date();
-    const data = { outcome, outcomeAt: outcome ? now : null, outcomeById: outcome ? req.user.id : null, followUpAt: null };
+    // followUpNotifiedAt reset: a new follow-up date gets its own reminder.
+    const data = { outcome, outcomeAt: outcome ? now : null, outcomeById: outcome ? req.user.id : null, followUpAt: null, followUpNotifiedAt: null };
+
+    // "Not interested", "No answer" or clearing the outcome would contradict
+    // appointments that are still booked — those are cancelled first, on purpose.
+    if (outcome === "NOT_INTERESTED" || outcome === "NO_ANSWER" || outcome === null) {
+      const live = await prisma.booking.count({ where: { conversationId: conversation.id, status: "BOOKED" } });
+      if (live > 0) {
+        return next(new AppError(
+          `This chat has ${live} booked appointment${live === 1 ? "" : "s"}. Cancel ${live === 1 ? "it" : "them"} first (contact panel → Bookings) if the patient no longer wants to come.`,
+          409,
+          "HAS_APPOINTMENTS",
+        ));
+      }
+    }
 
     // Booked is recorded through the chat's booking request (the open one, or a
     // new one) so every appointment has a request, a campaign and a history.
@@ -81,6 +95,16 @@ const setOutcome = async (req, res, next) => {
       data,
       include: { outcomeBy: PERSON, bookings: { orderBy: { createdAt: "desc" }, include: { createdBy: PERSON } } },
     });
+
+    // The open booking request follows the chat: "Not interested" / "No
+    // answer" close it with that reason, so the Bookings queue and the reports
+    // tell the same story as the chat.
+    if (outcome === "NOT_INTERESTED" || outcome === "NO_ANSWER") {
+      const open = await prisma.bookingRequest.findMany({ where: { conversationId: conversation.id, status: { in: br.OPEN } }, select: { id: true } });
+      for (const r of open) {
+        await br.closeNotBooked(r.id, { reason: outcome, note: "Closed from the chat outcome" }, req.user, {}, { syncOutcome: false });
+      }
+    }
 
     logAudit({
       action: "conversation.outcome_set",

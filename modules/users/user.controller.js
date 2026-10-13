@@ -3,6 +3,8 @@ const prisma = require("../../config/prisma");
 const AppError = require("../../utils/AppError");
 const logAudit = require("../../utils/audit");
 const { ROLES, roleHasPermission } = require("../../config/permissions");
+const { disconnectUser } = require("../../utils/socket");
+const { handOver, hasHistory } = require("../../utils/handOver");
 
 // Taken from the permission table rather than typed out here. This list was
 // once hard-coded to ADMIN and AGENT, which silently made MARKETING impossible
@@ -15,6 +17,7 @@ const SAFE_SELECT = {
   username: true,
   role: true,
   status: true,
+  isActive: true,
   lastActiveAt: true,
   createdAt: true,
   updatedAt: true,
@@ -101,7 +104,10 @@ const createUser = async (req, res, next) => {
 // ── Admin: update user ────────────────────────────────────────────────────────
 const updateUser = async (req, res, next) => {
   try {
-    const { name, username, role, status } = req.body;
+    const { name, username, role, status, isActive, handOverTo } = req.body;
+    const targetId = parseInt(req.params.id);
+    const before = await prisma.user.findUnique({ where: { id: targetId }, select: { id: true, role: true, isActive: true } });
+    if (!before) return next(new AppError("User not found", 404));
 
     const data = {};
     if (name !== undefined) data.name = name;
@@ -121,22 +127,41 @@ const updateUser = async (req, res, next) => {
       }
       data.status = status;
     }
+    // Deactivate (instead of delete): they can't sign in any more, their open
+    // chats and booking requests go to `handOverTo` (or back to the queue),
+    // and everything they did stays in the history under their name.
+    if (isActive !== undefined) {
+      if (targetId === req.user.id && isActive === false) {
+        return next(new AppError("You can't deactivate your own account", 400));
+      }
+      data.isActive = Boolean(isActive);
+      if (!data.isActive) data.status = "OFFLINE";
+    }
+    const losesInbox =
+      (data.isActive === false && before.isActive) ||
+      (data.role && roleHasPermission(before.role, "conversation:write") && !roleHasPermission(data.role, "conversation:write"));
+    let handedOver = null;
+    if (losesInbox) {
+      handedOver = await handOver(targetId, handOverTo ?? null, req.user, { reason: data.isActive === false ? "deactivated" : "role changed" });
+    }
 
     const user = await prisma.user.update({
-      where: { id: parseInt(req.params.id) },
+      where: { id: targetId },
       data,
       select: SAFE_SELECT,
     });
+    // Signed out everywhere at once when deactivated or their role changed.
+    if (data.isActive === false || (data.role && data.role !== before.role)) disconnectUser(targetId);
 
     logAudit({
       action: "user.updated",
       actor: req.user,
       targetType: "user",
       targetId: user.id,
-      details: data,
+      details: { ...data, ...(handedOver ? { handedOver } : {}) },
     });
 
-    res.status(200).json({ success: true, data: user });
+    res.status(200).json({ success: true, data: user, handedOver });
   } catch (err) {
     if (err.code === "P2025") return next(new AppError("User not found", 404));
     if (err.code === "P2002") return next(new AppError("Username already taken", 409));
@@ -179,6 +204,15 @@ const deleteUser = async (req, res, next) => {
 
     if (targetId === req.user.id) {
       return next(new AppError("You cannot delete your own account", 400));
+    }
+    // Deleting someone who replied, booked or owned chats would blank their
+    // name across the history (and drop their replies from response times).
+    if (await hasHistory(targetId)) {
+      return next(new AppError(
+        "This person has chats, replies or bookings in the history. Deactivate them instead — they can't sign in, and their work stays credited to them.",
+        409,
+        "USER_HAS_HISTORY",
+      ));
     }
 
     await prisma.user.delete({ where: { id: targetId } });
@@ -268,6 +302,17 @@ const updateMyStatus = async (req, res, next) => {
   }
 };
 
+// ── Self: end of shift — hand my open chats and booking requests over ───────
+// To a colleague (`toUserId`) or back to the shared queue (none given).
+const handOverMine = async (req, res, next) => {
+  try {
+    const result = await handOver(req.user.id, req.body?.toUserId ?? null, req.user, { reason: "end of shift" });
+    res.status(200).json({ success: true, data: result });
+  } catch (err) {
+    next(err);
+  }
+};
+
 // ── Self: change own display name ─────────────────────────────────────────────
 // The name colleagues see on assignments and replies. The username (login)
 // is changed by an admin, not here.
@@ -312,6 +357,7 @@ const changeMyPassword = async (req, res, next) => {
 };
 
 module.exports = {
+  handOverMine,
   updateMyProfile,
   getAllUsers,
   getAssignableUsers,

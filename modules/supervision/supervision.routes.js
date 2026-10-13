@@ -14,6 +14,19 @@ router.get("/conversations", getConversations);
 router.get("/conversations/:id", getConversationTimeline);
 router.get("/bookings", getBookings);
 router.get("/activity", getActivity);
+// Move one person's open chats and booking requests to a colleague / the queue.
+router.post("/hand-over", async (req, res, next) => {
+  try {
+    const AppError = require("../../utils/AppError");
+    const { handOver } = require("../../utils/handOver");
+    const fromUserId = parseInt(req.body?.fromUserId);
+    if (!Number.isInteger(fromUserId)) return next(new AppError("Choose whose chats to hand over", 400));
+    const result = await handOver(fromUserId, req.body?.toUserId ?? null, req.user, { reason: "supervisor reassigned" });
+    res.status(200).json({ success: true, data: result });
+  } catch (err) {
+    next(err);
+  }
+});
 // The PDF report: figures for a period, and the transcripts the supervisor ticks.
 const { getReport, getTranscripts } = require("./report.controller");
 router.get("/report", getReport);

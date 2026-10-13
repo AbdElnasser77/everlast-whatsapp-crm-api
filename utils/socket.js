@@ -7,6 +7,8 @@ const { mayUseNumber } = require("../middleware/whatsappNumber");
 const numberRoom = (numberId) => `number:${numberId}`;
 
 let io;
+// How long after a user's last tab closes before they show as offline.
+const OFFLINE_GRACE_MS = Number(process.env.OFFLINE_GRACE_MS) || 60 * 1000;
 
 const initSocket = (httpServer) => {
   io = require("socket.io")(httpServer, {
@@ -84,8 +86,33 @@ const initSocket = (httpServer) => {
       socket.to(numberRoom(room)).emit("typing.stop", { conversationId, username });
     });
 
+    // Using the app means being available: an agent the app marked offline
+    // (browser closed) is online again when they come back. A break they set
+    // themselves is left alone.
+    if (socket.user?.id) {
+      prisma.user
+        .updateMany({ where: { id: socket.user.id, status: "OFFLINE", isActive: true }, data: { status: "ONLINE" } })
+        .catch(() => {});
+    }
+
     socket.on("disconnect", () => {
       console.log("Socket client disconnected:", socket.id);
+      // Closing the browser used to leave an agent "Online" forever (presence
+      // only changed at login/logout). Once their last tab has been gone for
+      // a short while — long enough to survive a page reload — they are offline.
+      const userId = socket.user?.id;
+      if (userId) {
+        setTimeout(async () => {
+          try {
+            const live = await io.in(`user:${userId}`).fetchSockets();
+            if (live.length === 0) {
+              await prisma.user.updateMany({ where: { id: userId, status: { not: "OFFLINE" } }, data: { status: "OFFLINE" } });
+            }
+          } catch (err) {
+            console.error("Socket: presence update failed:", err.message);
+          }
+        }, OFFLINE_GRACE_MS);
+      }
     });
   });
 
@@ -167,9 +194,15 @@ const emitToNumberStaff = async (numberId, event, payload) => {
 //
 // Checks `io` directly rather than calling getIO(), which throws when the
 // socket layer was never initialised — e.g. under `npm run seed`.
+// Tell one person (all their open tabs), whatever line they are looking at.
+const emitToUser = (userId, event, payload) => {
+  if (!io || !userId) return;
+  io.to(`user:${userId}`).emit(event, payload);
+};
+
 const disconnectUser = (userId) => {
   if (!io) return;
   io.in(`user:${userId}`).disconnectSockets(true);
 };
 
-module.exports = { initSocket, getIO, disconnectUser, emitToNumber, emitGlobal, emitToNumberStaff };
+module.exports = { initSocket, getIO, disconnectUser, emitToNumber, emitGlobal, emitToNumberStaff, emitToUser };

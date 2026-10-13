@@ -123,7 +123,7 @@ const getReport = async (req, res, next) => {
           outcomesSet: outcomeEventsInScope.filter((e) => e.actorId === u.id).length,
         };
       })
-      .filter((a) => a.replies || a.appointmentsBooked || a.requestsBooked || a.requestsNotBooked || a.outcomesSet)
+      .filter((a) => a.replies || a.firstResponses || a.appointmentsBooked || a.requestsBooked || a.requestsNotBooked || a.outcomesSet)
       .sort((a, b) => b.replies - a.replies);
 
     // ── chats: every conversation with a message in the period ──
