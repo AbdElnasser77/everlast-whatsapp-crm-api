@@ -74,6 +74,9 @@ const ALL_PERMISSIONS = [
   // The Supervision page: every agent's chats, who is waiting, booking
   // progress, outcomes. SUPERVISOR and ADMIN.
   "team:supervise",
+  // Lifting a patient's opt-out (any source). ADMIN only, via "*": recording
+  // an opt-out is easy for everyone, taking one back is not.
+  "optout:lift",
   // Development tools (the message/cost tracker). ADMIN only, via "*"; the
   // /api/dev routes also don't exist in production at all.
   "dev:tools",

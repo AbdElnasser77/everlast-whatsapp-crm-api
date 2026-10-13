@@ -946,6 +946,14 @@ const getCampaigns = async (req, res, next) => {
       _count: { _all: true },
     }).then((rows) => rows.map((r) => ({ campaignId: r.campaignId, replied: r._count._all })));
 
+    // Appointments booked from this campaign's booking requests.
+    const bookedRaw = await prisma.booking.groupBy({
+      by: ["campaignId"],
+      where: { campaignId: { in: campaignIds }, status: "BOOKED" },
+      _count: { _all: true },
+    });
+    const bookedMap = new Map(bookedRaw.map((r) => [r.campaignId, r._count._all]));
+
     const deliveredMap = {};
     deliveredRaw.forEach((r) => { deliveredMap[r.campaignId] = r; });
 
@@ -957,6 +965,7 @@ const getCampaigns = async (req, res, next) => {
       deliveredCount: Number(deliveredMap[c.id]?.delivered || 0),
       readCount: Number(deliveredMap[c.id]?.read_count || 0),
       repliedCount: repliedMap[c.id] || 0,
+      bookedCount: bookedMap.get(c.id) || 0,
     }));
 
     res.status(200).json({ success: true, data: enriched });
@@ -1083,15 +1092,17 @@ const getCampaign = async (req, res, next) => {
 
     // The same three figures getCampaigns computes for the list. The detail page
     // shows them as stat cards, and they read 0 while only the list set them.
-    const [delivered, read, repliedCount] = await Promise.all([
+    const [delivered, read, repliedCount, bookedCount, bookingRequestsCount] = await Promise.all([
       prisma.campaignRecipient.count({ where: { campaignId: id, message: { status: { in: ["DELIVERED", "READ"] } } } }),
       prisma.campaignRecipient.count({ where: { campaignId: id, message: { status: "READ" } } }),
       prisma.campaignRecipient.count({ where: { campaignId: id, repliedAt: { not: null } } }),
+      prisma.booking.count({ where: { campaignId: id, status: "BOOKED" } }),
+      prisma.bookingRequest.count({ where: { campaignId: id } }),
     ]);
 
     res.status(200).json({
       success: true,
-      data: { ...campaign, deliveredCount: delivered, readCount: read, repliedCount },
+      data: { ...campaign, deliveredCount: delivered, readCount: read, repliedCount, bookedCount, bookingRequestsCount },
     });
   } catch (err) {
     next(err);

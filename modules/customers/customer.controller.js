@@ -1,6 +1,8 @@
 const prisma = require("../../config/prisma");
 const AppError = require("../../utils/AppError");
 const { emitToNumber } = require("../../utils/socket");
+const { roleHasPermission } = require("../../config/permissions");
+const logAudit = require("../../utils/audit");
 const { buildCustomerWhere, validateDefinition } = require("../../utils/segmentFilter");
 const {
   normalizeImportPhone,
@@ -248,12 +250,32 @@ const updateCustomer = async (req, res, next) => {
     if (departments !== undefined) data.departments = toStringArray(departments);
     if (tags !== undefined) data.tags = Array.isArray(tags) ? tags : [];
     if (notes !== undefined) data.notes = notes;
-    if (optedOut !== undefined) data.optedOut = Boolean(optedOut);
+    let optOutChange = null;
+    if (optedOut !== undefined) {
+      const before = await prisma.customer.findUnique({ where: { id }, select: { optedOut: true } });
+      if (before && before.optedOut !== Boolean(optedOut)) {
+        // Anyone may record an opt-out; only an admin may take one back.
+        if (!optedOut && !roleHasPermission(req.user.role, "optout:lift")) {
+          return next(new AppError("Only an admin can lift a patient's opt-out", 403, "OPTOUT_LIFT_FORBIDDEN"));
+        }
+        optOutChange = Boolean(optedOut);
+      }
+      data.optedOut = Boolean(optedOut);
+    }
 
     const customer = await prisma.customer.update({
       where: { id },
       data,
     });
+    if (optOutChange !== null) {
+      logAudit({
+        action: optOutChange ? "CUSTOMER_OPTED_OUT" : "CUSTOMER_OPTED_IN",
+        actor: req.user,
+        targetType: "Customer",
+        targetId: id,
+        details: { source: "MANUAL", scope: "all", via: "contact edit" },
+      });
+    }
     res.status(200).json({ success: true, data: customer });
 
     // Their chats show the name in the inbox list and chat header: refresh

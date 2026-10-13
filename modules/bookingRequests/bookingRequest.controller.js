@@ -2,6 +2,7 @@ const prisma = require("../../config/prisma");
 const AppError = require("../../utils/AppError");
 const br = require("../../utils/bookingRequests");
 const { workingMinutesBetween } = require("../../utils/workingTime");
+const { startOfLocalDay } = require("../supervision/supervision.controller");
 
 // The agents' booking queue, for the line in view (like the inbox). See
 // utils/bookingRequests.js for the rules.
@@ -12,6 +13,7 @@ const STATUSES = ["NEW", "IN_PROGRESS", "BOOKED", "NOT_BOOKED"];
 const INCLUDE = {
   customer: { select: { id: true, name: true, phone: true } },
   campaign: { select: { id: true, name: true } },
+  suggestedCampaign: { select: { id: true, name: true } },
   claimedBy: PERSON,
   handledBy: PERSON,
   bookings: { orderBy: { appointmentAt: "asc" }, include: { createdBy: PERSON } },
@@ -69,8 +71,7 @@ const listRequests = async (req, res, next) => {
 const getCounts = async (req, res, next) => {
   try {
     const scope = scopeOf(req);
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
+    const startOfToday = startOfLocalDay();
     const [fresh, inProgress, mine, bookedToday] = await Promise.all([
       prisma.bookingRequest.count({ where: { ...scope, status: "NEW" } }),
       prisma.bookingRequest.count({ where: { ...scope, status: "IN_PROGRESS" } }),
@@ -113,8 +114,34 @@ const claim = async (req, res, next) => {
 // Each: { service, appointmentAt, doctor?, dok32Ref?, note? }
 const book = async (req, res, next) => {
   try {
-    const r = await br.bookRequest(parseInt(req.params.id), req.body?.appointments, req.user, scopeOf(req));
+    const r = await br.bookRequest(parseInt(req.params.id), req.body?.appointments, req.user, scopeOf(req), req.body?.source || null);
     await reply(res, r.id);
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─── PUT /api/booking-requests/:id/source { leadSource, campaignId?, note? } ─
+const setSource = async (req, res, next) => {
+  try {
+    const r = await br.setSource(parseInt(req.params.id), req.body || {}, req.user, scopeOf(req));
+    await reply(res, r.id);
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─── GET /api/booking-requests/source-options ───────────────────────────────
+// The choices for "where did this patient come from": the fixed channels,
+// and this line's campaigns from the last 90 days.
+const getSourceOptions = async (req, res, next) => {
+  try {
+    const campaigns = await prisma.campaign.findMany({
+      where: { whatsappNumberId: req.numberId, deletedAt: null, startedAt: { gte: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) } },
+      orderBy: { startedAt: "desc" },
+      select: { id: true, name: true, startedAt: true },
+    });
+    res.status(200).json({ success: true, data: { leadSources: br.LEAD_SOURCES, campaigns } });
   } catch (err) {
     next(err);
   }
@@ -153,4 +180,4 @@ const createForChat = async (req, res, next) => {
   }
 };
 
-module.exports = { listRequests, getCounts, getRequest, claim, book, notBooked, reopen, createForChat, NOT_BOOKED_REASONS: br.NOT_BOOKED_REASONS };
+module.exports = { listRequests, getCounts, getRequest, claim, book, notBooked, reopen, createForChat, setSource, getSourceOptions, NOT_BOOKED_REASONS: br.NOT_BOOKED_REASONS };

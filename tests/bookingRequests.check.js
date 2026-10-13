@@ -23,6 +23,7 @@ const ctl = require("../modules/bookingRequests/bookingRequest.controller");
 const outcomeCtl = require("../modules/conversations/outcome.controller");
 const sup = require("../modules/supervision/supervision.controller");
 const campaigns = require("../modules/campaigns/campaign.controller");
+const report = require("../modules/supervision/report.controller");
 
 const RESET = "\x1b[0m", G = "\x1b[32m", R = "\x1b[31m", D = "\x1b[90m", B = "\x1b[1m";
 const TAG = "999560";
@@ -150,7 +151,7 @@ async function fromChat() {
   check("an invalid Booked creates no stray request", bad.error?.statusCode === 400 && (await prisma.bookingRequest.count({ where: { conversation: { customer: { name: `BR Patient ${seq}` } } } })) === 0);
 }
 
-async function queuesAndReports() {
+async function queuesAndReports(first) {
   console.log(`\n${B}queues and reports${RESET}`);
   const { agent, supervisor } = ctx;
   const fresh = await br.createFromFlowRun((await flowRun(await chat(), { preferred_date: "2026-10-22" })).id);
@@ -172,6 +173,22 @@ async function queuesAndReports() {
   check("Supervision's booking tab lists chats with an open request", list.body.data.some((r) => r.id === fresh.conversationId && r.openRequest?.id === fresh.id));
 
   const camp = await call(campaigns.getCampaign, req(supervisor, { params: { id: String(ctx.campaign.id) } }));
+  // The supervisor's report for today on this line.
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Dubai" }).format(new Date());
+  const rq = { query: { from: today, to: today, numberId: String(ctx.number.id) } };
+  const rep = await call(report.getReport, req(supervisor, rq));
+  const sm = rep.body?.data?.summary;
+  check("report: counts today's booking requests by source", sm && sm.bookingRequests >= 3 && sm.bookingRequestsBySource.FLOW >= 1 && sm.bookingRequestsBySource.AGENT >= 1, JSON.stringify(sm && sm.bookingRequestsBySource));
+  check("report: appointments booked and cancelled", sm && sm.appointmentsBooked >= 2 && sm.appointmentsCancelled >= 3, sm ? `booked ${sm.appointmentsBooked}, cancelled ${sm.appointmentsCancelled}` : "");
+  check("report: lists the bookings with service and who booked", rep.body.data.bookings.some((b) => b.service === "Teeth whitening" && b.bookedBy?.id === agent.id));
+  check("report: per-agent figures", rep.body.data.agents.some((a) => a.id === agent.id && a.appointmentsBooked >= 1));
+  const badRange = await call(report.getReport, req(supervisor, { query: { from: today, to: "2020-01-01" } }));
+  check("report: an end date before the start is refused", badRange.error?.statusCode === 400);
+  const tooLong = await call(report.getReport, req(supervisor, { query: { from: "2026-01-01", to: "2026-12-31" } }));
+  check("report: more than 92 days is refused", tooLong.error?.statusCode === 400);
+  const tr = await call(report.getTranscripts, req(supervisor, { query: { from: today, to: today, ids: `${fresh.conversationId},${first.conversation.id}` } }));
+  check("report: transcripts come back in the order asked", tr.body?.data?.length === 2 && tr.body.data[0].id === fresh.conversationId, tr.error?.message || "");
+
   check("the campaign shows what it produced: bookings and requests", camp.body?.data?.bookedCount >= 1 && camp.body.data.bookingRequestsCount >= 2, `booked ${camp.body?.data?.bookedCount}, requests ${camp.body?.data?.bookingRequestsCount}`);
 }
 
@@ -202,7 +219,7 @@ async function main() {
     const first = await fromFlow();
     await claimAndBook(first);
     await fromChat();
-    await queuesAndReports();
+    await queuesAndReports(first);
   } catch (err) {
     check("check ran without crashing", false, err.stack || err.message);
   } finally {

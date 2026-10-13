@@ -3,6 +3,7 @@ const AppError = require("../../utils/AppError");
 const logAudit = require("../../utils/audit");
 const { emitToNumber } = require("../../utils/socket");
 const { roleHasPermission } = require("../../config/permissions");
+const br = require("../../utils/bookingRequests");
 
 // How a chat ended up, set by the agent handling it, plus the appointment when
 // it was BOOKED and staff-only notes. What the Supervision page reports on.
@@ -46,18 +47,28 @@ const setOutcome = async (req, res, next) => {
 
     const now = new Date();
     const data = { outcome, outcomeAt: outcome ? now : null, outcomeById: outcome ? req.user.id : null, followUpAt: null };
-    let booking = null;
 
+    // Booked is recorded through the chat's booking request (the open one, or a
+    // new one) so every appointment has a request, a campaign and a history.
+    // Accepts several appointments, or the older single `booking`.
     if (outcome === "BOOKED") {
-      const b = req.body.booking || {};
-      const appointmentAt = validDate(b.appointmentAt);
-      if (!appointmentAt) return next(new AppError("Enter the appointment date and time", 400));
-      if (appointmentAt.getTime() < now.getTime() - 24 * 60 * 60 * 1000) {
-        return next(new AppError("The appointment is in the past", 400));
-      }
-      const service = b.service ? String(b.service).trim().slice(0, 120) : null;
-      const note = b.note ? String(b.note).trim().slice(0, 1000) : null;
-      booking = { appointmentAt, service: service || null, note: note || null };
+      const list = Array.isArray(req.body.appointments)
+        ? req.body.appointments
+        : req.body.booking
+          ? [req.body.booking]
+          : [];
+      br.cleanAppointments(list); // validate before creating anything
+      let request = await prisma.bookingRequest.findFirst({
+        where: { conversationId: conversation.id, status: { in: br.OPEN } },
+        orderBy: { createdAt: "desc" },
+      });
+      if (!request) request = await br.createForConversation(conversation, {}, req.user);
+      await br.bookRequest(request.id, list, req.user, { conversationId: conversation.id }, req.body.source || null);
+      const after = await prisma.conversation.findUnique({
+        where: { id: conversation.id },
+        include: { outcomeBy: PERSON, bookings: { orderBy: { createdAt: "desc" }, include: { createdBy: PERSON } } },
+      });
+      return res.status(200).json({ success: true, data: outcomeView(after) });
     }
     if (outcome === "FOLLOW_UP") {
       const followUpAt = validDate(req.body.followUpAt);
@@ -65,23 +76,10 @@ const setOutcome = async (req, res, next) => {
       data.followUpAt = followUpAt;
     }
 
-    const updated = await prisma.$transaction(async (tx) => {
-      if (booking) {
-        await tx.booking.create({
-          data: {
-            ...booking,
-            conversationId: conversation.id,
-            customerId: conversation.customerId,
-            whatsappNumberId: conversation.whatsappNumberId,
-            createdById: req.user.id,
-          },
-        });
-      }
-      return tx.conversation.update({
-        where: { id: conversation.id },
-        data,
-        include: { outcomeBy: PERSON, bookings: { orderBy: { createdAt: "desc" }, include: { createdBy: PERSON } } },
-      });
+    const updated = await prisma.conversation.update({
+      where: { id: conversation.id },
+      data,
+      include: { outcomeBy: PERSON, bookings: { orderBy: { createdAt: "desc" }, include: { createdBy: PERSON } } },
     });
 
     logAudit({
@@ -93,7 +91,6 @@ const setOutcome = async (req, res, next) => {
         outcome,
         previousOutcome: conversation.outcome,
         followUpAt: data.followUpAt,
-        ...(booking ? { appointmentAt: booking.appointmentAt, service: booking.service } : {}),
       },
     });
     emitToNumber(conversation.whatsappNumberId, "conversation.outcome", { conversationId: conversation.id, outcome });
@@ -116,6 +113,17 @@ const cancelBooking = async (req, res, next) => {
       data: { status: "CANCELLED", cancelledAt: new Date() },
     });
     if (count === 0) return next(new AppError("Booking not found or already cancelled", 404));
+    const cancelled = await prisma.booking.findUnique({ where: { id: bookingId }, select: { requestId: true } });
+    if (cancelled?.requestId) {
+      const stillBooked = await prisma.booking.count({ where: { requestId: cancelled.requestId, status: "BOOKED" } });
+      if (stillBooked === 0) {
+        // Nothing booked any more: back on the agent's list to rebook or close.
+        await prisma.bookingRequest.updateMany({
+          where: { id: cancelled.requestId, status: "BOOKED" },
+          data: { status: "IN_PROGRESS", handledById: null, handledAt: null },
+        });
+      }
+    }
     const live = await prisma.booking.count({ where: { conversationId: conversation.id, status: "BOOKED" } });
     if (live === 0 && conversation.outcome === "BOOKED") {
       await prisma.conversation.update({ where: { id: conversation.id }, data: { outcome: null, outcomeAt: null, outcomeById: null } });

@@ -302,7 +302,7 @@ section("instances: two server processes start the same campaign", async () => {
   const once = exactlyOnce(sendsByPhone(phones, [a.log, b.log]));
   const c = await getCampaign(campaign.id);
   check("two instances: everyone exactly once", once.ok, once.detail);
-  check("two instances: campaign COMPLETED", c.status === "COMPLETED", `→ ${c.status}; exits ${ea.code}/${eb.code}`);
+  check("two instances: campaign COMPLETED", c.status === "COMPLETED", `→ ${c.status}; exits ${ea.code}/${eb.code} | ${(ea.stderr + eb.stderr).slice(0, 600)}`);
 });
 
 section("delete: a customer is deleted while the campaign sends", async () => {

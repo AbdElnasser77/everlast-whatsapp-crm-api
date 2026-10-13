@@ -195,6 +195,30 @@ const sendConversationTyping = async (req, res, next) => {
 // what flows collected from them (booking requests), the chat's media, docs and
 // links, and the campaigns they received.
 const URL_RE = /https?:\/\/[^\s<>"')\]]+/gi;
+// ─── GET /api/conversations/line-counts ─────────────────────────────────────
+// Every active line at once — so an agent sees that another line has unread
+// chats, waiting patients or new booking requests without switching to it.
+const getLineCounts = async (req, res, next) => {
+  try {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const lines = await prisma.whatsAppNumber.findMany({ where: { isActive: true }, select: { id: true, label: true } });
+    const ids = lines.map((l) => l.id);
+    const [unread, waiting, requests] = await Promise.all([
+      prisma.conversation.groupBy({ by: ["whatsappNumberId"], where: { whatsappNumberId: { in: ids }, unreadCount: { gt: 0 }, status: { not: "RESOLVED" } }, _count: { _all: true } }),
+      prisma.conversation.groupBy({ by: ["whatsappNumberId"], where: { whatsappNumberId: { in: ids }, awaitingReplySince: { gte: since }, status: { not: "RESOLVED" } }, _count: { _all: true } }),
+      prisma.bookingRequest.groupBy({ by: ["whatsappNumberId"], where: { whatsappNumberId: { in: ids }, status: "NEW" }, _count: { _all: true } }),
+    ]);
+    const m = (rows) => new Map(rows.map((r) => [r.whatsappNumberId, r._count._all]));
+    const u = m(unread), w = m(waiting), r = m(requests);
+    res.status(200).json({
+      success: true,
+      data: lines.map((l) => ({ id: l.id, label: l.label, unreadChats: u.get(l.id) || 0, waiting: w.get(l.id) || 0, newBookingRequests: r.get(l.id) || 0 })),
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
 const getConversationProfile = async (req, res, next) => {
   try {
     const id = parseInt(req.params.id);
@@ -215,7 +239,7 @@ const getConversationProfile = async (req, res, next) => {
     const customerId = conversation.customer.id;
     const notDeleted = { conversationId: id, deletedAt: null };
 
-    const [runs, mediaRows, mediaCounts, linkRows, campaigns, optOut, messageCount, bookings, notes] = await Promise.all([
+    const [runs, mediaRows, mediaCounts, linkRows, campaigns, optOut, messageCount, bookings, notes, bookingRequests] = await Promise.all([
       prisma.flowRun.findMany({
         where: { conversationId: id },
         orderBy: { startedAt: "desc" },
@@ -262,6 +286,17 @@ const getConversationProfile = async (req, res, next) => {
         orderBy: { createdAt: "desc" },
         take: 50,
         include: { author: { select: { id: true, name: true, username: true } } },
+      }),
+      prisma.bookingRequest.findMany({
+        where: { conversationId: id },
+        orderBy: { createdAt: "desc" },
+        take: 20,
+        include: {
+          campaign: { select: { id: true, name: true } },
+          claimedBy: { select: { id: true, name: true, username: true } },
+          handledBy: { select: { id: true, name: true, username: true } },
+          bookings: { orderBy: { appointmentAt: "asc" } },
+        },
       }),
     ]);
 
@@ -328,6 +363,7 @@ const getConversationProfile = async (req, res, next) => {
         },
         bookings,
         notes,
+        bookingRequests,
         optOut,
         responses,
         media: mediaRows,
@@ -505,7 +541,8 @@ const changeConversationStatus = async (req, res, next) => {
 
     const conversation = await prisma.conversation.update({
       where: { id: conversationId },
-      data: { status },
+      // Resolving closes the matter: nobody is "waiting" on a resolved chat.
+      data: { status, ...(status === "RESOLVED" ? { awaitingReplySince: null } : {}) },
       include: {
         customer: { select: { name: true, phone: true } },
         assignedAgent: { select: ASSIGNEE_SELECT },
@@ -586,6 +623,7 @@ const createOrGetConversation = async (req, res, next) => {
 };
 
 module.exports = {
+  getLineCounts,
   getAllConversations,
   getConversationCounts,
   getConversationMessages,

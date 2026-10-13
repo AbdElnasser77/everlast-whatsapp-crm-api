@@ -11,13 +11,27 @@
 
 const prisma = require("../config/prisma");
 const AppError = require("./AppError");
-const { emitToNumber } = require("./socket");
+const { emitToNumber, emitToNumberStaff } = require("./socket");
 const logAudit = require("./audit");
 
 const OPEN = ["NEW", "IN_PROGRESS"];
 const NOT_BOOKED_REASONS = ["NO_ANSWER", "NOT_INTERESTED", "PRICE", "CALL_BACK_LATER", "BOOKED_ELSEWHERE", "OTHER"];
 const MAX_APPOINTMENTS = 10;
 const ATTRIBUTION_DAYS = 7;
+// How far back proof of coming from a campaign counts (its flow, a reply to it).
+const PROOF_DAYS = 14;
+
+// Where a patient came from. CAMPAIGN needs a campaign; OTHER needs a note.
+const LEAD_SOURCES = [
+  { value: "CAMPAIGN", label: "A campaign" },
+  { value: "INSTAGRAM", label: "Instagram" },
+  { value: "GOOGLE", label: "Google / website" },
+  { value: "REFERRAL", label: "Referral" },
+  { value: "WALK_IN", label: "Walk-in / phone call" },
+  { value: "RETURNING", label: "Returning patient" },
+  { value: "OTHER", label: "Other" },
+];
+const LEAD_SOURCE_VALUES = LEAD_SOURCES.map((s) => s.value);
 
 // Answers a booking flow collects. A run that saved any of these asked for a
 // booking. Named keys first; any key about a date / appointment / booking too,
@@ -28,11 +42,62 @@ const answersOf = (data) => (data && typeof data === "object" && data.answers &&
 const isBookingAnswers = (answers) =>
   Object.entries(answers || {}).some(([k, v]) => v !== null && v !== undefined && v !== "" && (BOOKING_KEYS.includes(k) || BOOKING_KEY_RE.test(k)));
 
-const emitChange = (request, event = "booking_request.updated") =>
+const emitChange = (request, event = "booking_request.updated") => {
   emitToNumber(request.whatsappNumberId, event, { requestId: request.id, conversationId: request.conversationId, status: request.status });
+  // A new one is an alert for everyone who can handle it — whatever line they
+  // are looking at (like a flow hand-off).
+  if (event === "booking_request.created") {
+    emitToNumberStaff(request.whatsappNumberId, "booking_request.alert", {
+      requestId: request.id,
+      conversationId: request.conversationId,
+      source: request.source,
+      requested: request.requested,
+    }).catch(() => {});
+  }
+};
 
-// The campaign a patient is answering: the one whose reply they're in, else
-// the latest campaign that reached them on this line in the last week.
+// What we know about which campaign brought this patient in:
+//  - proof (AUTOMATIC): they came through the campaign's flow, or replied to /
+//    tapped the campaign message itself (WhatsApp tells us which message);
+//  - a suggestion (SUGGESTED): a campaign reached them in the last week, but
+//    nothing ties this conversation to it — the agent decides;
+//  - nothing.
+async function campaignEvidence(conversation, { flowCampaignId = null } = {}) {
+  if (flowCampaignId) return { campaignId: flowCampaignId, sourceStatus: "AUTOMATIC" };
+  const since = new Date(Date.now() - PROOF_DAYS * 24 * 60 * 60 * 1000);
+  const [tapped, run] = await Promise.all([
+    // A patient message that answers a campaign send directly: it quotes the
+    // very message the campaign sent them (reply or button tap).
+    prisma.message.findFirst({
+      where: { conversationId: conversation.id, senderType: "CUSTOMER", createdAt: { gte: since }, campaignRecipientId: { not: null }, quotedMessageId: { not: null } },
+      orderBy: { createdAt: "desc" },
+      select: { quotedMessageId: true, campaignRecipient: { select: { messageId: true, campaignId: true } } },
+    }),
+    prisma.flowRun.findFirst({
+      where: { conversationId: conversation.id, campaignId: { not: null }, startedAt: { gte: since } },
+      orderBy: { startedAt: "desc" },
+      select: { campaignId: true },
+    }),
+  ]);
+  if (tapped && tapped.campaignRecipient && tapped.quotedMessageId === tapped.campaignRecipient.messageId) {
+    return { campaignId: tapped.campaignRecipient.campaignId, sourceStatus: "AUTOMATIC" };
+  }
+  if (run) return { campaignId: run.campaignId, sourceStatus: "AUTOMATIC" };
+  const recent = await campaignFor(conversation);
+  if (recent) return { suggestedCampaignId: recent, sourceStatus: "SUGGESTED" };
+  return {};
+}
+
+// The fields a request gets from the evidence.
+const sourceFields = (ev) =>
+  ev.sourceStatus === "AUTOMATIC"
+    ? { campaignId: ev.campaignId, leadSource: "CAMPAIGN", sourceStatus: "AUTOMATIC" }
+    : ev.sourceStatus === "SUGGESTED"
+      ? { suggestedCampaignId: ev.suggestedCampaignId, sourceStatus: "SUGGESTED" }
+      : {};
+
+// The latest campaign that reached them on this line in the last week (a
+// suggestion only — see campaignEvidence).
 async function campaignFor(conversation) {
   const recipient = await prisma.campaignRecipient.findFirst({
     where: {
@@ -65,7 +130,7 @@ async function createFromFlowRun(runId) {
         whatsappNumberId: run.conversation.whatsappNumberId,
         source: "FLOW",
         flowRunId: run.id,
-        campaignId: run.campaignId ?? (await campaignFor(run.conversation)),
+        ...sourceFields(await campaignEvidence(run.conversation, { flowCampaignId: run.campaignId })),
         requested: answersOf(run.data),
       },
     });
@@ -88,7 +153,7 @@ async function createForConversation(conversation, { service, preferredDate, not
       customerId: conversation.customerId,
       whatsappNumberId: conversation.whatsappNumberId,
       source: "AGENT",
-      campaignId: await campaignFor(conversation),
+      ...sourceFields(await campaignEvidence(conversation)),
       requested,
       note: note ? String(note).trim().slice(0, 1000) : null,
       createdById: user.id,
@@ -101,6 +166,44 @@ async function createForConversation(conversation, { service, preferredDate, not
   logAudit({ action: "booking_request.created", actor: user, targetType: "conversation", targetId: conversation.id, details: { requestId: request.id } });
   emitChange(request, "booking_request.created");
   return request;
+}
+
+// Checks the agent's "where did this patient come from" answer.
+async function cleanSource(source, request) {
+  const leadSource = String(source?.leadSource || "").toUpperCase();
+  if (!LEAD_SOURCE_VALUES.includes(leadSource)) {
+    throw new AppError("Choose where this patient came from", 400, "SOURCE_REQUIRED");
+  }
+  const note = source?.note ? String(source.note).trim().slice(0, 300) : null;
+  if (leadSource === "OTHER" && !note) throw new AppError("Say where this patient came from", 400);
+  let campaignId = null;
+  if (leadSource === "CAMPAIGN") {
+    campaignId = parseInt(source?.campaignId);
+    if (!Number.isInteger(campaignId)) throw new AppError("Choose which campaign", 400, "SOURCE_REQUIRED");
+    const campaign = await prisma.campaign.findFirst({ where: { id: campaignId, whatsappNumberId: request.whatsappNumberId }, select: { id: true } });
+    if (!campaign) throw new AppError("That campaign isn't on this line", 400);
+  }
+  return { leadSource, campaignId, sourceNote: note };
+}
+
+const sourceKnown = (r) => r.sourceStatus === "AUTOMATIC" || r.sourceStatus === "CONFIRMED";
+
+// Set or correct where a request's patient came from. Its appointments follow.
+async function setSource(requestId, source, user, scope = {}) {
+  const request = await prisma.bookingRequest.findFirst({ where: { id: requestId, ...scope } });
+  if (!request) throw new AppError("Booking request not found", 404);
+  const clean = await cleanSource(source, request);
+  const updated = await prisma.$transaction(async (tx) => {
+    const r = await tx.bookingRequest.update({
+      where: { id: request.id },
+      data: { ...clean, sourceStatus: "CONFIRMED", sourceConfirmedById: user.id, sourceConfirmedAt: new Date() },
+    });
+    await tx.booking.updateMany({ where: { requestId: request.id }, data: { campaignId: clean.campaignId, leadSource: clean.leadSource } });
+    return r;
+  });
+  logAudit({ action: "booking_request.source_set", actor: user, targetType: "conversation", targetId: request.conversationId, details: { requestId: request.id, ...clean, previous: { leadSource: request.leadSource, campaignId: request.campaignId } } });
+  emitChange(updated);
+  return updated;
 }
 
 // Checks and cleans the appointments an agent entered.
@@ -123,12 +226,23 @@ function cleanAppointments(list) {
 // Records appointment(s) booked from a request. A request already BOOKED can
 // take more (the patient added something later). The chat's outcome becomes
 // BOOKED.
-async function bookRequest(requestId, appointments, user, scope = {}) {
+// `source` = { leadSource, campaignId?, note? } — required unless the source is
+// already proven or confirmed. Appointments are credited to a campaign only
+// when the source says CAMPAIGN.
+async function bookRequest(requestId, appointments, user, scope = {}, source = null) {
   const clean = cleanAppointments(appointments);
   const request = await prisma.bookingRequest.findFirst({ where: { id: requestId, ...scope } });
   if (!request) throw new AppError("Booking request not found", 404);
   if (request.status === "NOT_BOOKED") throw new AppError("This request was closed as not booked — reopen it first", 409, "REQUEST_CLOSED");
+  let src = null;
+  if (source && source.leadSource) src = await cleanSource(source, request);
+  else if (!sourceKnown(request)) {
+    throw new AppError("Choose where this patient came from before booking", 400, "SOURCE_REQUIRED");
+  }
+  const credited = src ? src.campaignId : request.campaignId;
+  const leadSource = src ? src.leadSource : request.leadSource;
   const now = new Date();
+  const before = await prisma.conversation.findUnique({ where: { id: request.conversationId }, select: { outcome: true } });
   const result = await prisma.$transaction(async (tx) => {
     for (const a of clean) {
       await tx.booking.create({
@@ -138,7 +252,8 @@ async function bookRequest(requestId, appointments, user, scope = {}) {
           customerId: request.customerId,
           whatsappNumberId: request.whatsappNumberId,
           requestId: request.id,
-          campaignId: request.campaignId,
+          campaignId: credited,
+          leadSource,
           createdById: user.id,
         },
       });
@@ -153,8 +268,11 @@ async function bookRequest(requestId, appointments, user, scope = {}) {
         claimedAt: request.claimedAt ?? now,
         notBookedReason: null,
         notBookedNote: null,
+        ...(src ? { ...src, sourceStatus: "CONFIRMED", sourceConfirmedById: user.id, sourceConfirmedAt: now } : {}),
       },
     });
+    // Earlier appointments on this request follow a changed source.
+    if (src) await tx.booking.updateMany({ where: { requestId: request.id }, data: { campaignId: credited, leadSource } });
     await tx.conversation.update({
       where: { id: request.conversationId },
       data: { outcome: "BOOKED", outcomeAt: now, outcomeById: user.id, followUpAt: null },
@@ -168,6 +286,17 @@ async function bookRequest(requestId, appointments, user, scope = {}) {
     targetId: request.conversationId,
     details: { requestId: request.id, appointments: clean.map((a) => ({ service: a.service, appointmentAt: a.appointmentAt })) },
   });
+  // The chat's outcome changed too: recorded like any other outcome change, so
+  // the chat's history and the report's outcome counts include it.
+  if (before?.outcome !== "BOOKED") {
+    logAudit({
+      action: "conversation.outcome_set",
+      actor: user,
+      targetType: "conversation",
+      targetId: request.conversationId,
+      details: { outcome: "BOOKED", previousOutcome: before?.outcome ?? null, requestId: request.id },
+    });
+  }
   emitChange(result);
   emitToNumber(request.whatsappNumberId, "conversation.outcome", { conversationId: request.conversationId, outcome: "BOOKED" });
   return result;
@@ -226,6 +355,9 @@ async function reopenRequest(requestId, user, scope = {}) {
 }
 
 module.exports = {
+  LEAD_SOURCES,
+  campaignEvidence,
+  setSource,
   OPEN,
   NOT_BOOKED_REASONS,
   isBookingAnswers,

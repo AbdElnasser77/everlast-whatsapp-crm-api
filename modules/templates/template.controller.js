@@ -5,6 +5,7 @@ const AppError = require("../../utils/AppError");
 const { sendWhatsAppMessage } = require("../../utils/whatsappClient");
 const numbers = require("../../utils/whatsappNumbers");
 const { emitToNumber } = require("../../utils/socket");
+const logAudit = require("../../utils/audit");
 const { claimIfUnassigned } = require("../../utils/conversationAssignment");
 const { handOffOnAgentReply } = require("../../utils/flowEngine");
 const { readClientMessageId, findDuplicateSend, isClientIdRace, assertMayReply } = require("../../utils/replyGuards");
@@ -630,6 +631,34 @@ const sendTemplate = async (req, res, next) => {
     // RE_ENGAGEMENT and CAMPAIGN require APPROVED status
     if (template.category !== "GENERAL" && template.approvalStatus !== "APPROVED") {
       return next(new AppError(`${template.category} templates must be APPROVED before sending`, 400));
+    }
+
+    // Consent. A marketing template to a patient who opted out (on this line
+    // or everywhere) needs an explicit confirmation, and is audited. Utility
+    // templates (appointment details…) aren't marketing and go through.
+    const isMarketing = template.metaCategory ? template.metaCategory === "MARKETING" : template.category !== "GENERAL";
+    if (isMarketing) {
+      const lineOptOut = await prisma.customerOptOut.findUnique({
+        where: { customerId_whatsappNumberId: { customerId: conversation.customerId, whatsappNumberId: conversation.whatsappNumberId } },
+        select: { id: true },
+      });
+      if (conversation.customer.optedOut || lineOptOut) {
+        if (req.body.confirmOptedOut !== true) {
+          return next(new AppError(
+            "This patient opted out of marketing messages. Send this offer anyway only if they asked for it.",
+            409,
+            "OPTED_OUT",
+            { scope: conversation.customer.optedOut ? "all" : "line" },
+          ));
+        }
+        logAudit({
+          action: "TEMPLATE_SENT_TO_OPTED_OUT",
+          actor: req.user,
+          targetType: "Customer",
+          targetId: conversation.customerId,
+          details: { templateId: template.id, templateName: template.name, conversationId: conversation.id },
+        });
+      }
     }
 
     // Inside the 24-hour window any template may be sent. Outside it (including a

@@ -588,7 +588,8 @@ model Campaign {
   @@index([whatsappNumberId, status])
   @@index([whatsappNumberId, category])
   @@index([status, pauseReason])
-  bookingRequests  BookingRequest[]
+  bookingRequests  BookingRequest[] @relation("CreditedBookingRequests")
+  suggestedBookingRequests BookingRequest[] @relation("SuggestedBookingRequests")
 }
 
 model CampaignRecipient {
@@ -736,7 +737,10 @@ model Booking {
   // The request it was booked from, and the campaign that request came from.
   requestId        Int?
   request          BookingRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  // Copied from the request when booked: the credited campaign (proven or
+  // confirmed only) and where the patient came from.
   campaignId       Int?
+  leadSource       String?
   createdById      Int?
   createdBy        User?         @relation("BookingsCreated", fields: [createdById], references: [id], onDelete: SetNull)
   appointmentAt    DateTime
@@ -767,9 +771,24 @@ model BookingRequest {
   customer         Customer             @relation(fields: [customerId], references: [id], onDelete: Cascade)
   whatsappNumberId Int
   source           BookingRequestSource
-  // Where it came from: the campaign (if any) and the flow run that collected it.
+  // The campaign this request is CREDITED to — only with proof (the patient
+  // came through the campaign's flow or replied to its message) or after an
+  // agent confirmed it. What campaign results count.
   campaignId       Int?
-  campaign         Campaign?            @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  campaign         Campaign?            @relation("CreditedBookingRequests", fields: [campaignId], references: [id], onDelete: SetNull)
+  // A campaign the patient received lately but with no proof they came from
+  // it: offered to the agent as a suggestion, never counted until confirmed.
+  suggestedCampaignId Int?
+  suggestedCampaign   Campaign?         @relation("SuggestedBookingRequests", fields: [suggestedCampaignId], references: [id], onDelete: SetNull)
+  // Where the patient came from: CAMPAIGN | INSTAGRAM | GOOGLE | REFERRAL |
+  // WALK_IN | RETURNING | OTHER.
+  leadSource       String?
+  // AUTOMATIC (proven) | SUGGESTED (a guess, needs the agent) | CONFIRMED (set
+  // by an agent). Null = nothing known yet.
+  sourceStatus     String?
+  sourceNote       String?
+  sourceConfirmedById Int?
+  sourceConfirmedAt DateTime?
   flowRunId        Int?                 @unique
   // What the patient asked for, as collected: { service, preferred_date, … }.
   requested        Json                 @default("{}")

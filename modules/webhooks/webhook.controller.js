@@ -498,11 +498,16 @@ const processChangePayload = async (body) => {
     }
 
     // Use upsert to avoid race condition when two webhooks arrive simultaneously for the same customer
-    const customer = await prisma.customer.upsert({
+    // The WhatsApp profile name ("Mom ❤️", a nickname) only fills an empty name:
+    // a name the team typed or imported (chart name) is never overwritten.
+    let customer = await prisma.customer.upsert({
       where: { phone },
-      update: name ? { name } : {},
+      update: {},
       create: { phone, name },
     });
+    if (!customer.name && name) {
+      customer = await prisma.customer.update({ where: { id: customer.id }, data: { name } });
+    }
     console.log("Webhook: customer id", customer.id);
 
     // Honor opt-out / opt-in keywords (STOP / START, etc.) from the customer.
@@ -517,6 +522,13 @@ const processChangePayload = async (body) => {
         create: { customerId: customer.id, whatsappNumberId: number.id, source: "KEYWORD" },
       });
       console.log("Webhook: customer", customer.id, "opted OUT of", number.label);
+      logAudit({
+        action: "CUSTOMER_OPTED_OUT",
+        actor: null,
+        targetType: "Customer",
+        targetId: customer.id,
+        details: { source: "KEYWORD", scope: "line", whatsappNumberId: number.id, keyword: String(content || "").trim().slice(0, 30) },
+      });
     } else if (optIntent === "IN") {
       // START undoes only what the customer did themselves (a STOP keyword, or
       // WhatsApp's own stop). An opt-out a person on the team recorded, or one
@@ -525,6 +537,15 @@ const processChangePayload = async (body) => {
         where: { customerId: customer.id, whatsappNumberId: number.id, source: { in: ["KEYWORD", "WHATSAPP"] } },
       });
       console.log("Webhook: customer", customer.id, count ? "opted IN to" : "sent START (no self opt-out to lift) on", number.label);
+      if (count) {
+        logAudit({
+          action: "CUSTOMER_OPTED_IN",
+          actor: null,
+          targetType: "Customer",
+          targetId: customer.id,
+          details: { source: "KEYWORD", scope: "line", whatsappNumberId: number.id },
+        });
+      }
     }
 
     // Use upsert to avoid race condition when creating conversation
@@ -619,7 +640,11 @@ const processChangePayload = async (body) => {
         lastCustomerMessageAt: new Date(),
         // Starts the "waiting for a reply" clock if it isn't running already.
         ...patientWroteData(conversation),
-        ...(reopening ? { status: "OPEN" } : {}),
+        // Reopening a resolved chat starts fresh: the wait from now, and the
+        // previous outcome (kept in the history) no longer shows as current.
+        ...(reopening
+          ? { status: "OPEN", awaitingReplySince: new Date(), outcome: null, outcomeAt: null, outcomeById: null, followUpAt: null }
+          : {}),
       },
     });
 
@@ -630,7 +655,7 @@ const processChangePayload = async (body) => {
         actor: null,
         targetType: "conversation",
         targetId: conversation.id,
-        details: { status: "OPEN", previousStatus: "RESOLVED", reason: "customer replied" },
+        details: { status: "OPEN", previousStatus: "RESOLVED", reason: "customer replied", previousOutcome: conversation.outcome || null },
       });
     }
 

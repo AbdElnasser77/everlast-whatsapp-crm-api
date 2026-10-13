@@ -14,5 +14,15 @@ router.get("/conversations", getConversations);
 router.get("/conversations/:id", getConversationTimeline);
 router.get("/bookings", getBookings);
 router.get("/activity", getActivity);
+// The PDF report: figures for a period, and the transcripts the supervisor ticks.
+const { getReport, getTranscripts } = require("./report.controller");
+router.get("/report", getReport);
+router.get("/report/transcripts", getTranscripts);
+// The separate, detailed reports.
+const { getBookingsReport, getTeamReport, getCampaignsReport, getChatsReport } = require("./reports.controller");
+router.get("/reports/bookings", getBookingsReport);
+router.get("/reports/team", getTeamReport);
+router.get("/reports/campaigns", getCampaignsReport);
+router.get("/reports/chats", getChatsReport);
 
 module.exports = router;

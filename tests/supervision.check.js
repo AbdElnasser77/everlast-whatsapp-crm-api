@@ -166,7 +166,9 @@ async function supervisionViews(bookedConvId) {
   const reqConv = await patientWrites(phone(), "I'd like to book");
   const dropConv = await patientWrites(phone(), "offers?");
   if (flow) {
-    await prisma.flowRun.create({ data: { flowId: flow.id, conversationId: reqConv.id, customerId: reqConv.customerId, status: "COMPLETED", data: { answers: { preferred_date: "2026-10-20", contact_number: "0501234567" } } } });
+    const bookingRun = await prisma.flowRun.create({ data: { flowId: flow.id, conversationId: reqConv.id, customerId: reqConv.customerId, status: "COMPLETED", data: { answers: { preferred_date: "2026-10-20", contact_number: "0501234567" } } } });
+    // What the flow does when it finishes: the answers become a booking request.
+    await require("../utils/bookingRequests").createFromFlowRun(bookingRun.id);
     await prisma.flowRun.create({ data: { flowId: flow.id, conversationId: dropConv.id, customerId: dropConv.customerId, status: "EXPIRED", data: { answers: {} } } });
   }
 
@@ -285,6 +287,7 @@ async function main() {
     await prisma.flowRun.deleteMany({ where: { conversationId: { in: convIds } } });
     await prisma.flow.deleteMany({ where: { id: { in: made.flows } } });
     await prisma.booking.deleteMany({ where: { conversationId: { in: convIds } } });
+    await prisma.bookingRequest.deleteMany({ where: { conversationId: { in: convIds } } });
     await prisma.conversationNote.deleteMany({ where: { conversationId: { in: convIds } } });
     await prisma.message.deleteMany({ where: { conversationId: { in: convIds } } });
     await prisma.auditLog.deleteMany({ where: { OR: [{ targetType: "conversation", targetId: { in: convIds } }, { actorId: { in: made.users } }] } });

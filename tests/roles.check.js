@@ -67,6 +67,13 @@ const ENDPOINTS = [
   ["GET", "/api/supervision/conversations", "team:supervise"],
   ["GET", `/api/supervision/conversations/${NOPE}`, "team:supervise"],
   ["GET", "/api/supervision/bookings", "team:supervise"],
+  ["GET", "/api/supervision/activity", "team:supervise"],
+  ["GET", "/api/supervision/report", "team:supervise"],
+  ["GET", "/api/supervision/report/transcripts", "team:supervise"],
+  ["GET", "/api/supervision/reports/bookings", "team:supervise"],
+  ["GET", "/api/supervision/reports/team", "team:supervise"],
+  ["GET", "/api/supervision/reports/campaigns", "team:supervise"],
+  ["GET", "/api/supervision/reports/chats", "team:supervise"],
   // chat outcome + notes
   ["PUT", `/api/conversations/${NOPE}/outcome`, "conversation:write"],
   ["POST", `/api/conversations/${NOPE}/bookings/${NOPE}/cancel`, "conversation:write"],

@@ -238,10 +238,18 @@ async function sendBot(ctx, { kind, text, mediaType, mediaUrl, footer, header, b
 }
 
 async function finish(run, status, extra = {}) {
-  return prisma.flowRun.update({
+  const done = await prisma.flowRun.update({
     where: { id: run.id },
     data: { status, currentNodeId: null, completedAt: new Date(), ...extra },
   });
+  // A booking flow that got what the patient wants becomes a booking request
+  // on the agents' list. Never allowed to break the flow itself.
+  if (status === "COMPLETED" || status === "HANDED_OFF") {
+    await require("./bookingRequests")
+      .createFromFlowRun(done.id)
+      .catch((err) => console.error(`[Flow] booking request for run ${done.id} failed:`, err.message));
+  }
+  return done;
 }
 
 /**
