@@ -35,8 +35,9 @@ const LEAD_SOURCE_VALUES = LEAD_SOURCES.map((s) => s.value);
 
 // Answers a booking flow collects. A run that saved any of these asked for a
 // booking. Named keys first; any key about a date / appointment / booking too,
-// since flow authors name their own fields.
-const BOOKING_KEYS = ["preferred_date", "preferred_time", "contact_number", "service", "appointment_date"];
+// since flow authors name their own fields. slot_status: a Pick appointment
+// step found no free day — the team still has to arrange one.
+const BOOKING_KEYS = ["preferred_date", "preferred_time", "contact_number", "service", "appointment_date", "slot_status"];
 const BOOKING_KEY_RE = /date|appointment|booking|book_/i;
 const answersOf = (data) => (data && typeof data === "object" && data.answers && typeof data.answers === "object" ? data.answers : {});
 const isBookingAnswers = (answers) =>

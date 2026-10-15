@@ -344,6 +344,13 @@ async function walk(ctx, run, graph, startNodeId) {
         await sendBot(ctx, { kind: "message", text: say(d.text) });
         return prisma.flowRun.update({ where: { id: run.id }, data: { currentNodeId: node.id, data } });
       }
+      case "slot_picker": {
+        if ((await slotAdvance(ctx, run, node, data, { kind: "enter" })) === "park") {
+          return prisma.flowRun.update({ where: { id: run.id }, data: { currentNodeId: node.id, data } });
+        }
+        nodeId = nextNodeId(graph, node.id, "next"); // no free days at all: the team takes it from here
+        break;
+      }
       case "tag": {
         const tags = ctx.customer.tags || [];
         if (!tags.includes(d.tag)) {
@@ -407,6 +414,318 @@ async function walk(ctx, run, graph, startNodeId) {
     }
   }
   return finish(run, "FAILED", { data, lastError: `Stopped after ${MAX_STEPS_PER_WALK} steps without waiting for the customer — check the flow for a loop` });
+}
+
+// ── Pick appointment (slot_picker) ──────────────────────────────────────────
+//
+// The patient picks a day, then a time, that are actually free in the clinic
+// system (Dok32, read-only through utils/clinicAvailability.js — nothing is
+// booked there; an agent still books by hand).
+//   1. Day: a list of the nearest open days. They tap one or type a date
+//      ("tomorrow", "25 Oct", "20/10"…).
+//   2. Time: a list of that day's free times. A busy day (more than fits in
+//      one list) first asks Morning / Afternoon / Evening. They can also type
+//      a time ("4:30 pm"), or go back to "Another day".
+//   3. The chosen time is checked once more right then; if it just went, they
+//      get the day's free times again.
+// Saves preferred_date (YYYY-MM-DD), preferred_time (HH:MM), slot_checked:
+// true and slot_label ("Tue 21 Oct, 4:30 PM" — usable as {{slot_label}}).
+//
+// Never allowed to break the flow: if the clinic system is unreachable (or
+// not set up) the step falls back to two plain questions and saves the raw
+// answers with slot_checked: false. No free day at all → a message, and
+// slot_status: "NONE_AVAILABLE" so the request still reaches the agents.
+//
+// Taps carry everything they mean in the button id (d.<date>, p.<date>.<part>,
+// t.<date>.<HH:MM>, days), so a tap on an older list still works. Only typed
+// answers need the step's state, kept in run.data.slot.
+
+const SLOT_DEFAULTS = {
+  dayText: "📅 Which day suits you best? Pick a day below, or type a date (e.g. 25 Oct).",
+  timeText: "🕒 Which time suits you on {{day}}? Pick a time below, or type one (e.g. 4:30 pm).",
+  noSlotsText: "Sorry, we have no free appointments in the coming days — one of our team will contact you to arrange a time.",
+  fallbackDayText: "Which day suits you?",
+  fallbackTimeText: "What time suits you best?",
+};
+const SLOT_ROWS = 10; // WhatsApp's list limit
+const MAX_SLOT_MISSES = 3; // typed answers we couldn't use before taking their words as they are
+const SLOT_OPTION_RE = /^(days|d\.\d{4}-\d{2}-\d{2}|p\.\d{4}-\d{2}-\d{2}\.(morning|afternoon|evening)|t\.\d{4}-\d{2}-\d{2}\.\d{2}:\d{2})$/;
+// "4", "4pm", "16:30", "4.30 p.m." — never a date.
+const PLAIN_TIME_RE = /^\d{1,2}([:.]\d{2})?\s*(am|pm|a\.m\.|p\.m\.)?$/i;
+const DAY_PARTS = [
+  { id: "morning", title: "🌅 Morning", has: (t) => t < "12:00" },
+  { id: "afternoon", title: "☀️ Afternoon", has: (t) => t >= "12:00" && t < "17:00" },
+  { id: "evening", title: "🌙 Evening", has: (t) => t >= "17:00" },
+];
+
+// Thrown when the clinic system can't answer — the step then falls back.
+class ClinicUnavailable extends Error {}
+
+// Loaded lazily: the module may be missing or Dok32 unconfigured, and the
+// flow must work regardless.
+async function clinic(fn, ...args) {
+  try {
+    const mod = require("./clinicAvailability");
+    if (!mod.isConfigured()) throw new Error("Dok32 is not configured");
+    return await mod[fn](...args);
+  } catch (err) {
+    throw new ClinicUnavailable(`${fn}: ${err.message}`);
+  }
+}
+
+// "16:30" → "4:30 PM"
+function fmtSlotTime(hhmm) {
+  const [h, m] = hhmm.split(":").map(Number);
+  return `${h % 12 || 12}:${String(m).padStart(2, "0")} ${h < 12 ? "AM" : "PM"}`;
+}
+
+const ISO_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+// "2026-10-21" → "Tue 21 Oct" (as the clinic module labels days)
+const dayLabel = (iso) =>
+  new Date(`${iso}T00:00:00Z`).toLocaleDateString("en-GB", { timeZone: "UTC", weekday: "short", day: "numeric", month: "short" });
+
+// `n` items spread evenly over the list, first and last included.
+function spread(list, n) {
+  if (list.length <= n) return list;
+  return Array.from({ length: n }, (_, i) => list[Math.round((i * (list.length - 1)) / (n - 1))]);
+}
+
+const clip = (s, max) => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
+
+/**
+ * One move of a Pick appointment step. action = { kind: "enter" } |
+ * { kind: "tap", optionId } | { kind: "text", text }. Sends what the patient
+ * sees next and updates `data` (answers + data.slot). Returns "park" (wait for
+ * the patient) or "done" (continue to the step's next node).
+ */
+async function slotAdvance(ctx, run, node, data, action) {
+  const d = node.data || {};
+  const text = (key, vars = {}) => interpolate(d[key] || SLOT_DEFAULTS[key], ctx.customer, { ...data.answers, ...vars });
+  const opt = (optionId) => replyId(run.id, node.id, optionId);
+  const fresh = action.kind === "enter" || !data.slot || data.slot.node !== node.id;
+  const st = fresh ? { node: node.id, phase: "day", misses: 0 } : data.slot;
+  data.slot = st;
+
+  // The day this move is about, if any — kept when the clinic system fails.
+  let chosenDate = st.phase === "time" ? st.date : null;
+
+  const done = (answers, answer) => {
+    delete data.answers.slot_status; // from an earlier visit of this step
+    delete data.answers.slot_label;
+    Object.assign(data.answers, answers);
+    // Unchecked answers get a label too, so {{slot_label}} in a later message
+    // always reads ("Sun 18 Oct, after 5").
+    if (!data.answers.slot_label && !data.answers.slot_status) {
+      const { preferred_date: day, preferred_time: time } = data.answers;
+      const label = [day && ISO_DAY_RE.test(day) ? dayLabel(day) : day, time && /^\d{2}:\d{2}$/.test(time) ? fmtSlotTime(time) : time];
+      if (label.some(Boolean)) data.answers.slot_label = label.filter(Boolean).join(", ");
+    }
+    delete data.slot;
+    data.path.push({ node: node.id, answer, at: new Date().toISOString() });
+    return "done";
+  };
+
+  // ── Without the clinic system: two plain questions ──
+  const askFallbackDay = async () => {
+    st.phase = "fallback_date";
+    await sendBot(ctx, { kind: "message", text: text("fallbackDayText") });
+    return "park";
+  };
+  const askFallbackTime = async () => {
+    st.phase = "fallback_time";
+    await sendBot(ctx, { kind: "message", text: text("fallbackTimeText") });
+    return "park";
+  };
+
+  // ── Day ──
+  const showDays = async (intro) => {
+    const days = await clinic("nearestOpenDays", { count: SLOT_ROWS });
+    if (!days || !days.length) {
+      await sendBot(ctx, { kind: "message", text: text("noSlotsText") });
+      return done({ slot_status: "NONE_AVAILABLE", slot_checked: false }, "No free appointments");
+    }
+    st.phase = "day";
+    delete st.date;
+    await sendBot(ctx, {
+      kind: "list",
+      text: intro ? `${intro}\n\nHere are the nearest available days — pick one below, or type a date (e.g. 25 Oct).` : text("dayText"),
+      list: {
+        buttonLabel: "Choose a day",
+        rows: days.slice(0, SLOT_ROWS).map((day) => ({
+          id: opt(`d.${day.date}`),
+          title: clip(day.label, 24),
+          description: `${day.slots.length} time${day.slots.length === 1 ? "" : "s"} available`,
+        })),
+      },
+    });
+    return "park";
+  };
+  const notOpen = async (day, lead = "") => showDays(`${lead}${await clinic("describeStatus", day)}`);
+
+  // ── Time ── (`part` narrows a busy day to morning / afternoon / evening)
+  const showTimes = async (day, lead, part) => {
+    st.phase = "time";
+    st.date = day.date;
+    const back = { id: opt("days"), title: "📅 Another day" };
+    const parts = DAY_PARTS.filter((p) => day.slots.some(p.has));
+    const inPart = part ? day.slots.filter(DAY_PARTS.find((p) => p.id === part).has) : day.slots;
+
+    // Too many times for one list (one row is "Another day"): ask the part of the day first.
+    if (inPart.length > SLOT_ROWS - 1 && !part && parts.length > 1) {
+      const body = `${lead ? `${lead} ` : ""}🕒 ${day.label} has plenty of free times. Which part of the day suits you?`;
+      const ids = parts.map((p) => ({ ...p, optionId: `p.${day.date}.${p.id}` }));
+      if (parts.length < 3) {
+        // Buttons, with room left for "Another day".
+        const buttons = [...ids.map((p) => ({ id: p.optionId, title: p.title })), { id: "days", title: back.title }];
+        await sendBot(ctx, { kind: "message", text: body, buttons: buttons.map((b) => ({ ...b, waId: opt(b.id) })) });
+      } else {
+        await sendBot(ctx, {
+          kind: "list",
+          text: body,
+          list: {
+            buttonLabel: "Choose",
+            rows: [
+              ...ids.map((p) => {
+                const times = day.slots.filter(p.has);
+                return { id: opt(p.optionId), title: p.title, description: `${times.length} times · ${fmtSlotTime(times[0])} – ${fmtSlotTime(times[times.length - 1])}` };
+              }),
+              back,
+            ],
+          },
+        });
+      }
+      return "park";
+    }
+
+    const times = spread(inPart, SLOT_ROWS - 1);
+    await sendBot(ctx, {
+      kind: "list",
+      text: lead ? `${lead}\n\nHere are the free times on ${day.label} — pick one below, or type a time.` : text("timeText", { day: day.label }),
+      list: {
+        buttonLabel: "Choose a time",
+        rows: [...times.map((t) => ({ id: opt(`t.${day.date}.${t}`), title: fmtSlotTime(t) })), back],
+      },
+    });
+    return "park";
+  };
+
+  // The final check, right when the time is chosen.
+  const pickTime = async (date, time, known) => {
+    const day = known || (await clinic("getDay", date));
+    const listed = day.status === "OPEN" && day.slots.includes(time);
+    if (!listed || !(await clinic("isSlotFree", date, time))) {
+      // Gone since the list went out. Fresh times, without the one they wanted.
+      const now = listed ? await clinic("getDay", date) : day;
+      if (now.status === "PAST") return notOpen(now);
+      const left = now.status === "OPEN" ? now.slots.filter((t) => t !== time) : [];
+      if (!left.length) return now.status === "OPEN" ? showDays("That time was just taken 😕") : notOpen(now, "That time was just taken 😕 ");
+      return showTimes({ ...now, slots: left }, "That time was just taken 😕");
+    }
+    const label = `${day.label}, ${fmtSlotTime(time)}`;
+    return done({ preferred_date: date, preferred_time: time, slot_checked: true, slot_label: label }, label);
+  };
+
+  const chooseDay = async (date) => {
+    const day = await clinic("getDay", date);
+    if (day.status !== "OPEN") return notOpen(day);
+    return showTimes(day);
+  };
+
+  // A typed answer we couldn't use. After MAX_SLOT_MISSES, take their words as
+  // they are and let the team sort it out.
+  const miss = async (raw, retry) => {
+    st.misses = (st.misses || 0) + 1;
+    if (st.misses < MAX_SLOT_MISSES) return retry();
+    if (st.phase === "time" && st.date) {
+      return done({ preferred_date: st.date, preferred_time: raw.slice(0, 200), slot_checked: false }, raw);
+    }
+    data.answers.preferred_date = raw.slice(0, 200);
+    data.answers.slot_checked = false;
+    return askFallbackTime();
+  };
+
+  try {
+    if (action.kind === "enter") return await showDays();
+
+    if (action.kind === "tap") {
+      const id = action.optionId;
+      st.misses = 0;
+      if (id === "days") return await showDays();
+      const [kind, date, rest] = id.split(".");
+      chosenDate = date;
+      if (kind === "d") return await chooseDay(date);
+      if (kind === "p") {
+        const day = await clinic("getDay", date);
+        if (day.status !== "OPEN") return await notOpen(day);
+        return await showTimes(day, null, rest);
+      }
+      return await pickTime(date, rest);
+    }
+
+    const raw = String(action.text || "").trim().slice(0, 500);
+    if (st.phase === "fallback_date") {
+      data.answers.preferred_date = raw;
+      data.answers.slot_checked = false;
+      return await askFallbackTime();
+    }
+    if (st.phase === "fallback_time") {
+      return done({ preferred_time: raw, slot_checked: false }, raw);
+    }
+
+    if (st.phase === "time" && st.date) {
+      // A date instead ("20 Oct", "tomorrow"): they'd rather another day. Checked
+      // first, since "20 Oct" also reads as 20:00 — unless it's plainly a time.
+      const otherDate = PLAIN_TIME_RE.test(raw) ? null : await clinic("parsePatientDate", raw);
+      const time = otherDate ? null : await clinic("parsePatientTime", raw);
+      if (otherDate) {
+        chosenDate = otherDate;
+        const day = await clinic("getDay", otherDate);
+        if (day.status !== "OPEN") return await miss(raw, () => notOpen(day));
+        st.misses = 0;
+        return await showTimes(day);
+      }
+      const day = await clinic("getDay", st.date);
+      if (day.status !== "OPEN") return await notOpen(day);
+      if (!time) return await miss(raw, () => showTimes(day, "Sorry, I didn't catch that time."));
+      if (!day.slots.includes(time)) {
+        return await miss(raw, () => showTimes(day, `Sorry, ${fmtSlotTime(time)} isn't available on ${day.label}.`));
+      }
+      return await pickTime(day.date, time, day);
+    }
+
+    const date = await clinic("parsePatientDate", raw);
+    if (!date) return await miss(raw, () => showDays("Sorry, I didn't catch that date."));
+    chosenDate = date;
+    const day = await clinic("getDay", date);
+    if (day.status !== "OPEN") return await miss(raw, () => notOpen(day));
+    st.misses = 0;
+    return await showTimes(day);
+  } catch (err) {
+    if (!(err instanceof ClinicUnavailable)) throw err;
+    console.warn(`[flow] run ${run.id}: clinic system unavailable, asking plainly (${err.message})`);
+    // The day they already chose stays; ask for the rest in plain words.
+    if (chosenDate) {
+      data.answers.preferred_date = chosenDate;
+      data.answers.slot_checked = false;
+      return askFallbackTime();
+    }
+    return askFallbackDay();
+  }
+}
+
+/** A tap or typed answer for a parked (or earlier) Pick appointment step. */
+async function resumeSlot(ctx, run, graph, node, action) {
+  try {
+    const data = dataOf(run);
+    if ((await slotAdvance(ctx, run, node, data, action)) === "park") {
+      return await prisma.flowRun.update({ where: { id: run.id }, data: { currentNodeId: node.id, data } });
+    }
+    const saved = await prisma.flowRun.update({ where: { id: run.id }, data: { data } });
+    return await walk(ctx, saved, graph, nextNodeId(graph, node.id, "next"));
+  } catch (err) {
+    console.error(`[flow] run ${run.id} failed:`, err.message);
+    return finish(run, "FAILED", { lastError: err.message.slice(0, 500) }).catch(() => {});
+  }
 }
 
 async function safeWalk(ctx, run, graph, startNodeId) {
@@ -489,10 +808,13 @@ async function hasOptedOut(ctx) {
  *     their mind.
  *   - From a finished run (completed, expired, replaced): start a fresh run
  *     from that point, keeping the answers already given (e.g. which offer).
- *   - Never after a hand-off: once a person has the chat, the bot stays out
- *     (a new tap on the campaign message can still start over).
+ *   - Not while a person has the chat: after a hand-off the bot stays out
+ *     until HANDOFF_QUIET_MS has passed with no reply from the team (a new
+ *     tap on the campaign message can always start over).
  *   - Never after STOP.
  */
+const HANDOFF_QUIET_MS = 24 * 60 * 60 * 1000;
+
 async function resumeFromTap(ctx, tapped, active) {
   const source =
     active && active.id === tapped.runId
@@ -503,17 +825,28 @@ async function resumeFromTap(ctx, tapped, active) {
   const latest = await prisma.flowRun.findFirst({
     where: { conversationId: ctx.conversation.id },
     orderBy: { startedAt: "desc" },
-    select: { status: true },
+    select: { status: true, completedAt: true },
   });
-  if (latest?.status === "HANDED_OFF") return; // an agent has it
+  if (latest?.status === "HANDED_OFF") {
+    // A patient coming back days later gets the menus again; a conversation
+    // the team is having now is never interrupted.
+    const quietSince = new Date(Date.now() - HANDOFF_QUIET_MS);
+    if (!latest.completedAt || latest.completedAt > quietSince) return;
+    const teamReplied = await prisma.message.count({
+      where: { conversationId: ctx.conversation.id, senderType: "AGENT", campaignRecipientId: null, deletedAt: null, createdAt: { gt: quietSince } },
+    });
+    if (teamReplied > 0) return;
+  }
   if (await hasOptedOut(ctx)) return;
 
   const flow = source.flow;
   if (!flow || !flow.isActive) return;
   const graph = flow.graph;
   const node = nodeById(graph, tapped.nodeId);
-  const choice = node && resolveTap(node, tapped.optionId);
-  if (!choice) return; // that step or button was removed since — leave it to the agents
+  // A Pick appointment tap means what its id says (a day, a time…); see slotAdvance.
+  const slotTap = node?.type === "slot_picker" && SLOT_OPTION_RE.test(tapped.optionId);
+  const choice = node && !slotTap && resolveTap(node, tapped.optionId);
+  if (!choice && !slotTap) return; // that step or button was removed since — leave it to the agents
 
   let run = source;
   if (source.status !== "ACTIVE") {
@@ -528,6 +861,8 @@ async function resumeFromTap(ctx, tapped, active) {
       },
     });
   }
+
+  if (slotTap) return resumeSlot(ctx, run, graph, node, { kind: "tap", optionId: tapped.optionId });
 
   const data = dataOf(run);
   if (node.data.variable) data.answers[node.data.variable] = choice.saveAs;
@@ -592,10 +927,13 @@ function handleInbound({ numberId, customer, conversation, inbound, campaignRepl
       return safeWalk(ctx, run, startMatch.flow.graph, startMatch.nextNodeId);
     }
 
-    // 3. A typed answer to a parked Question step.
+    // 3. A typed answer to a parked Question (or Pick appointment) step.
     if (active && active.currentNodeId) {
       const graph = active.flow.graph;
       const node = nodeById(graph, active.currentNodeId);
+      if (node?.type === "slot_picker" && inbound.rawType === "text") {
+        return resumeSlot(ctx, active, graph, node, { kind: "text", text: inbound.content });
+      }
       if (node?.type !== "question" || inbound.rawType !== "text") return; // not an answer — the agents see it in the inbox
       const value = parseAnswer(node.data.inputType, inbound.content);
       if (value === null) {

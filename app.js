@@ -76,6 +76,8 @@ app.use("/api/whatsapp", require("./modules/whatsapp-status/whatsappStatus.route
 app.use("/api/settings", require("./modules/settings/settings.routes"));
 app.use("/api/supervision", require("./modules/supervision/supervision.routes"));
 app.use("/api/booking-requests", require("./modules/bookingRequests/bookingRequest.routes"));
+// Free appointment times in Dok32 (read-only).
+app.use("/api/availability", require("./modules/availability/availability.routes"));
 // Dev-only tools (message/cost tracker). Never mounted in production.
 if (process.env.NODE_ENV !== "production") {
   app.use("/api/dev", require("./modules/dev/dev.routes"));
